@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=69.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-sdlc-backend"
+version = "0.1.0"
+description = "Backend service for AI Software Development Lifecycle Automation"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.1",
+    "sqlalchemy==2.0.36",
+    "alembic==1.14.0",
+    "psycopg[binary,pool]==3.2.3",
+    "redis==5.2.1",
+    "celery==5.4.0",
+    "PyJWT==2.10.1",
+    "bcrypt==4.2.1",
+    "cryptography==44.0.0",
+    "httpx==0.28.1",
+    "GitPython==3.1.44",
+    "qdrant-client==1.12.2",
+    "langchain-core==0.3.28",
+    "langgraph==0.2.60",
+    "langgraph-checkpoint-postgres==2.0.9",
+    "langsmith==0.2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-cov==6.0.0",
+    "ruff==0.8.4",
+    "mypy==1.14.0",
+    "bandit==1.8.0",
+    "pip-audit==2.7.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "S", "BLE", "C4", "SIM"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["celery.*", "git.*", "qdrant_client.*", "langgraph.*"]
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
