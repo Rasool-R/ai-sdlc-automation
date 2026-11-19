@@ -13,7 +13,7 @@ from app.core.exceptions import AuthenticationError
 from app.schemas.auth import TokenClaims
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_TYPE = "access"  # noqa: S105
+ACCESS_TOKEN_TYPE = "access"  # noqa: S105 # nosec B105
 
 
 def hash_password(plain_password: str) -> str:
