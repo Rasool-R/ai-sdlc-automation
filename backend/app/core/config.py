@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: Literal["openai", "local", "disabled"] = "openai"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_API_KEY: str = ""
+    EMBEDDING_BASE_URL: str = ""
 
     LANGSMITH_TRACING: bool = False
     LANGSMITH_API_KEY: str = ""
@@ -114,11 +115,19 @@ class Settings(BaseSettings):
         for idx, key in enumerate(raw_keys):
             try:
                 Fernet(key.encode("utf-8"))
-            except Exception as exc:
+            except ValueError as exc:
                 raise ValueError(
                     f"Invalid Fernet key format at position {idx}."
                 ) from exc
         return ",".join(raw_keys)
+
+    @field_validator("LLM_BASE_URL", "EMBEDDING_BASE_URL")
+    @classmethod
+    def validate_optional_http_url(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and not cleaned.startswith(("http://", "https://")):
+            raise ValueError("Endpoint base URL must start with http:// or https://.")
+        return cleaned
 
     @model_validator(mode="after")
     def validate_conditional_integrations(self) -> "Settings":
@@ -133,6 +142,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "GITHUB_AUTH_MODE='pat_fallback' is only permitted in local development."
                 )
+
+        if self.EMBEDDING_PROVIDER == "local" and not self.EMBEDDING_BASE_URL:
+            raise ValueError(
+                "EMBEDDING_BASE_URL is required when EMBEDDING_PROVIDER is 'local'."
+            )
 
         if self.LANGSMITH_TRACING and not self.LANGSMITH_API_KEY.strip():
             raise ValueError(
