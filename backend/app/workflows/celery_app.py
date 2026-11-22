@@ -1,6 +1,6 @@
 """Celery application factory configured for reliable background job execution."""
 
-from celery import Celery # type: ignore[import-untyped]
+from celery import Celery
 
 from app.core.config import get_settings
 
