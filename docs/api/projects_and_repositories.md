@@ -18,9 +18,13 @@ All endpoints below require a valid single-operator Bearer JWT obtained from `PO
 | `POST` | `/api/v1/repositories/connect` | Authorize via GitHub, persist repo, and pin base commit SHA | `201`, `401`, `403`, `404`, `409`, `422`, `502` |
 | `GET` | `/api/v1/repositories` | List repositories (`project_id`, `limit`, `offset`) | `200`, `401`, `422` |
 | `GET` | `/api/v1/repositories/{repository_id}` | Get repository metadata and latest pinned version | `200`, `401`, `404` |
+| `POST` | `/api/v1/repositories/{repository_id}/index` | Acquire lock, clone isolated workspace, and incrementally index AST + optional Qdrant embeddings | `200`, `401`, `404`, `409`, `422`, `502` |
+| `GET` | `/api/v1/repositories/{repository_id}/structure` | Query indexed Python symbols and dependency edges (`commit_sha`, `file_path`, `kind`, `limit`, `offset`) | `200`, `401`, `404`, `422` |
 
-### Privacy and Safety Defaults
+### Privacy, Fallback, and Safety Defaults
 
 - `llm_data_sharing` defaults to `false` on every connected repository; private code is never transmitted to an external LLM or embedding provider without explicit opt-in and prior secret scanning.
-- Connecting a repository fetches and persists the exact `commit_sha` of the target branch in `repository_versions` and records a redacted audit entry in `audit_logs`.
+- Local/self-hosted embedding endpoints (`EMBEDDING_PROVIDER=local` with `EMBEDDING_BASE_URL`) are permitted for private repositories without external data-sharing opt-in.
+- If Qdrant or the embedding provider is unavailable or denied by policy, indexing and retrieval degrade gracefully to structural-only PostgreSQL mode without failing.
+- Every indexed snapshot, symbol, relationship, and vector is strictly scoped to `(repository_id, commit_sha)` so versions are never mixed.
 - Credentials are never returned in API responses.

@@ -138,6 +138,11 @@ class PythonAstParser:
     def __init__(self, *, discovery_service: RepositoryDiscoveryService | None = None) -> None:
         self._discovery = discovery_service or RepositoryDiscoveryService()
 
+    @property
+    def discovery_service(self) -> RepositoryDiscoveryService:
+        """Return the configured repository file discovery service."""
+        return self._discovery
+
     def parse_python_source(
         self,
         *,
@@ -274,11 +279,12 @@ class PythonAstParser:
             end_line=node.end_lineno or node.lineno,
         )
 
-    def _extract_dependencies(
+    def extract_dependencies(
         self,
         workspace_dir: Path,
         discovered_files: list[DiscoveredFile],
     ) -> list[DependencyMetadata]:
+        """Extract statically declared package dependencies from manifest files."""
         dependencies: list[DependencyMetadata] = []
         for file_entry in discovered_files:
             rel_path = file_entry.relative_path
@@ -355,18 +361,21 @@ class PythonAstParser:
             base_parts.append(target_module)
         return ".".join(p for p in base_parts if p)
 
-    def _build_symbols_and_relationships(
+    def build_symbols_and_relationships(
         self,
         *,
         modules: list[ModuleMetadata],
         commit_sha: str,
+        known_non_test_modules: set[str] | None = None,
     ) -> tuple[list[CodeSymbol], list[CodeRelationship]]:
+        """Derive validated symbols and directed structural edges from parsed modules."""
         symbols: list[CodeSymbol] = []
         relationships: list[CodeRelationship] = []
-        known_modules = {mod.module_name: mod for mod in modules}
-        non_test_modules = {
-            mod.module_name for mod in modules if not mod.is_test_module
-        }
+        non_test_modules = (
+            set(known_non_test_modules)
+            if known_non_test_modules is not None
+            else {mod.module_name for mod in modules if not mod.is_test_module}
+        )
 
         for mod in modules:
             end_line = max(mod.line_count, 1)
@@ -386,7 +395,6 @@ class PythonAstParser:
                 )
             )
 
-            # Import relationships
             for imp in mod.imports:
                 resolved_target = self._resolve_relative_import(
                     mod.module_name,
@@ -407,7 +415,6 @@ class PythonAstParser:
                     )
                 )
 
-                # Test-to-source association via direct import of an internal module
                 if mod.is_test_module and resolved_target:
                     matched_source = self._match_internal_module(resolved_target, non_test_modules)
                     if matched_source:
@@ -423,7 +430,6 @@ class PythonAstParser:
                             )
                         )
 
-            # Top-level functions
             for func in mod.functions:
                 symbols.append(
                     CodeSymbol(
@@ -470,7 +476,6 @@ class PythonAstParser:
                         )
                     )
 
-            # Classes and methods
             for cls in mod.classes:
                 symbols.append(
                     CodeSymbol(
@@ -561,7 +566,6 @@ class PythonAstParser:
                             )
                         )
 
-            # Naming-based fallback test-to-source association (e.g., test_orders.py -> *.orders)
             if mod.is_test_module:
                 stem = Path(mod.file_path).stem
                 candidate_stem = stem.removeprefix("test_").removesuffix("_test")
@@ -580,7 +584,6 @@ class PythonAstParser:
                                 )
                             )
 
-        # Deduplicate relationships preserving insertion order
         deduped: list[CodeRelationship] = []
         seen_edges: set[tuple[str, str, str, str, int | None]] = set()
         for rel in relationships:
@@ -595,7 +598,6 @@ class PythonAstParser:
                 seen_edges.add(key)
                 deduped.append(rel)
 
-        _ = known_modules
         return symbols, deduped
 
     def _match_internal_module(
@@ -666,8 +668,8 @@ class PythonAstParser:
                 )
             )
 
-        dependencies = self._extract_dependencies(workspace_dir, discovered_files)
-        symbols, relationships = self._build_symbols_and_relationships(
+        dependencies = self.extract_dependencies(workspace_dir, discovered_files)
+        symbols, relationships = self.build_symbols_and_relationships(
             modules=modules_meta,
             commit_sha=commit_sha,
         )

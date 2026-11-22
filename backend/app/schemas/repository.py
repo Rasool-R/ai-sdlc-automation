@@ -1,4 +1,4 @@
-"""Pydantic schemas for connecting repositories and tracking immutable base versions."""
+"""Pydantic schemas for connecting, indexing, and inspecting repositories."""
 
 from datetime import datetime
 from typing import Literal
@@ -63,3 +63,77 @@ class RepositoryListResponse(BaseModel):
 
     items: list[RepositoryRead]
     total: int
+
+
+class RepositoryIndexRequest(BaseModel):
+    """Request payload for triggering version-pinned repository indexing."""
+
+    branch: str | None = Field(default=None, min_length=1, max_length=100)
+    commit_sha: str | None = Field(default=None, min_length=7, max_length=64)
+    force_reindex: bool = False
+
+
+class RepositoryIndexResponse(BaseModel):
+    """Summary returned after indexing a repository snapshot."""
+
+    snapshot_id: str
+    repository_id: str
+    commit_sha: str
+    status: str
+    files_indexed_count: int = Field(ge=0)
+    symbols_count: int = Field(ge=0)
+    relationships_count: int = Field(ge=0)
+    parse_errors_count: int = Field(ge=0)
+    semantic_indexed: bool
+    reused_snapshot: bool
+    unchanged_files_skipped: int = Field(ge=0)
+    reindexed_files: int = Field(ge=0)
+    deleted_files: int = Field(ge=0)
+    secrets_redacted_count: int = Field(ge=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class IndexedSymbolRead(BaseModel):
+    """Serialized structural code symbol with exact version provenance."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    symbol_id: str
+    name: str
+    qualified_name: str
+    kind: str
+    file_path: str
+    commit_sha: str
+    content_hash: str
+    start_line: int
+    end_line: int
+    signature: str | None
+    docstring: str | None
+    is_test: bool
+
+
+class IndexedRelationshipRead(BaseModel):
+    """Serialized structural or dependency relationship edge."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    source_symbol: str
+    target_symbol: str
+    relationship_type: str
+    confidence: str
+    file_path: str
+    line: int | None
+
+
+class RepositoryStructureResponse(BaseModel):
+    """Versioned structural overview returned by the repository structure endpoint."""
+
+    repository_id: str
+    snapshot_id: str
+    commit_sha: str
+    files_indexed_count: int = Field(ge=0)
+    semantic_indexed: bool
+    symbols: list[IndexedSymbolRead]
+    relationships: list[IndexedRelationshipRead]
+    total_symbols: int = Field(ge=0)
+    total_relationships: int = Field(ge=0)

@@ -2,6 +2,13 @@
 
 from app.intelligence.ast_parser import PythonAstParser
 from app.intelligence.discovery import RepositoryDiscoveryService
+from app.intelligence.indexer import IndexResult, RepositoryIndexer
+from app.intelligence.retrieval import (
+    HybridRetrievalService,
+    RetrievalResponse,
+    RetrievedContextItem,
+    RetrievedRelationship,
+)
 from app.intelligence.schemas import (
     ClassMetadata,
     CodeRelationship,
@@ -25,11 +32,17 @@ __all__ = [
     "DiscoveredFile",
     "FileMetadata",
     "FunctionMetadata",
+    "HybridRetrievalService",
     "ImportMetadata",
+    "IndexResult",
     "MethodMetadata",
     "ModuleMetadata",
     "ParseErrorRecord",
     "PythonAstParser",
     "RepositoryDiscoveryService",
+    "RepositoryIndexer",
     "RepositoryMetadata",
+    "RetrievalResponse",
+    "RetrievedContextItem",
+    "RetrievedRelationship",
 ]

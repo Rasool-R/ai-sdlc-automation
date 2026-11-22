@@ -10,8 +10,11 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import AuthenticationError
 from app.core.security import decode_access_token
 from app.db.session import get_db
+from app.integrations.embeddings.client import EmbeddingClient
 from app.integrations.github.client import GitHubClient
+from app.integrations.qdrant.client import QdrantIndexClient
 from app.schemas.auth import OperatorIdentity
+from app.services.workspace_service import WorkspaceService
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -36,6 +39,28 @@ def get_github_client() -> Generator[GitHubClient, None, None]:
         client.close()
 
 
+def get_workspace_service() -> WorkspaceService:
+    """Provide a WorkspaceService bound to configured workspace root and quotas."""
+    return WorkspaceService()
+
+
+def get_embedding_client() -> Generator[EmbeddingClient, None, None]:
+    """Provide a request-scoped EmbeddingClient instance and ensure clean shutdown."""
+    client = EmbeddingClient()
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+def get_qdrant_client() -> QdrantIndexClient:
+    """Provide a QdrantIndexClient configured with application settings."""
+    return QdrantIndexClient()
+
+
 CurrentOperator = Annotated[OperatorIdentity, Depends(get_current_operator)]
 DbSession = Annotated[Session, Depends(get_db)]
 GitHubClientDep = Annotated[GitHubClient, Depends(get_github_client)]
+WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
+EmbeddingClientDep = Annotated[EmbeddingClient, Depends(get_embedding_client)]
+QdrantClientDep = Annotated[QdrantIndexClient, Depends(get_qdrant_client)]
