@@ -84,7 +84,7 @@ def classify_protected_path(relative_path: str) -> tuple[ProtectedPathCategory, 
         name_lower == "dockerfile"
         or name_lower.startswith("dockerfile.")
         or name_lower.endswith(".dockerfile")
-        or (name_lower.startswith("docker-compose") and path_obj.suffix.lower() in {".yml", ".yaml"})
+        or (name_lower.startswith("docker-compose") and path_obj.suffix.lower() in {".yml",".yaml"})
     ):
         return ("docker", "Container build/runtime configuration requires explicit human approval.")
 
