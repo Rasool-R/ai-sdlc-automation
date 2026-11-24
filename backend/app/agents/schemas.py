@@ -1,4 +1,4 @@
-"""Versioned Pydantic v2 input/output handoff contracts for vertical-slice SDLC agents."""
+"""Versioned Pydantic v2 input/output handoff contracts for all seven SDLC agents."""
 
 from typing import Literal
 
@@ -7,6 +7,18 @@ from pydantic import BaseModel, Field
 from app.execution.schemas import PatchBundle
 
 AGENT_SCHEMA_VERSION = "1.0"
+
+ReviewSeverity = Literal["Critical", "High", "Medium", "Low", "Informational"]
+FindingClassification = Literal["confirmed_defect", "potential_risk"]
+FailureCategory = Literal[
+    "assertion_failure",
+    "runtime_error",
+    "import_or_syntax_error",
+    "dependency_error",
+    "timeout",
+    "environment_error",
+    "unknown",
+]
 
 
 class AcceptanceCriterion(BaseModel):
@@ -116,3 +128,69 @@ class CodingOutput(BaseModel):
     rationale: str = Field(min_length=5, max_length=2000)
     key_decisions: list[str] = Field(default_factory=list)
     patch: PatchBundle
+
+
+class TestFailureDiagnosis(BaseModel):
+    """Structured failure analysis and bounded correction plan from the Testing Agent."""
+
+    schema_version: str = AGENT_SCHEMA_VERSION
+    summary: str = Field(min_length=5, max_length=1000)
+    failure_category: FailureCategory
+    root_cause: str = Field(min_length=5, max_length=2000)
+    failing_tests: list[str] = Field(default_factory=list)
+    affected_files: list[str] = Field(default_factory=list)
+    coverage_gaps: list[str] = Field(default_factory=list)
+    recommended_fixes: list[str] = Field(default_factory=list)
+    correction_instructions: str = Field(min_length=5, max_length=3000)
+    is_fixable_by_coding_agent: bool = True
+
+
+class CodeReviewFinding(BaseModel):
+    """Single structured finding produced by the Code Review Agent."""
+
+    id: str = Field(min_length=1, max_length=32)
+    severity: ReviewSeverity
+    classification: FindingClassification
+    category: str = Field(min_length=2, max_length=64)
+    file_path: str = Field(min_length=1, max_length=512)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    title: str = Field(min_length=3, max_length=200)
+    description: str = Field(min_length=5, max_length=1500)
+    recommendation: str = Field(min_length=3, max_length=1000)
+
+
+class TestIntegrityAssessment(BaseModel):
+    """Explicit Code Review disposition for a deterministic test-integrity flag."""
+
+    file_path: str = Field(min_length=1, max_length=512)
+    rule_id: str = Field(min_length=1, max_length=64)
+    addressed: bool
+    justification: str = Field(min_length=3, max_length=1000)
+
+
+class CodeReviewReport(BaseModel):
+    """Structured output contract for the Code Review Agent with deterministic gating."""
+
+    schema_version: str = AGENT_SCHEMA_VERSION
+    passed: bool
+    summary: str = Field(min_length=5, max_length=2000)
+    requirement_coverage_notes: list[str] = Field(default_factory=list)
+    test_quality_notes: list[str] = Field(default_factory=list)
+    findings: list[CodeReviewFinding] = Field(default_factory=list)
+    test_integrity_assessments: list[TestIntegrityAssessment] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+
+
+class ReleasePreparationOutput(BaseModel):
+    """Evidence-based PR preparation and final report contract from the Release Agent."""
+
+    schema_version: str = AGENT_SCHEMA_VERSION
+    pr_title: str = Field(min_length=5, max_length=120)
+    pr_description: str = Field(min_length=10, max_length=8000)
+    release_notes: str = Field(min_length=5, max_length=4000)
+    changed_files_summary: list[str] = Field(min_length=1)
+    test_results_summary: str = Field(min_length=5, max_length=2000)
+    review_summary: str = Field(min_length=5, max_length=2000)
+    limitations: list[str] = Field(default_factory=list)
+    final_report_markdown: str = Field(min_length=20, max_length=12000)
