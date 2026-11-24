@@ -17,6 +17,7 @@ WorkflowStatus = Literal[
     "running",
     "waiting_clarification",
     "waiting_plan_approval",
+    "waiting_commit_approval",
     "completed",
     "rejected",
     "failed",
@@ -30,6 +31,7 @@ class HumanDecision(BaseModel):
     action: Literal["approve", "reject", "clarify"]
     actor: str = Field(min_length=1, max_length=100)
     approved_plan_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    approved_patch_hash: str | None = Field(default=None, min_length=64, max_length=64)
     approved_base_commit_sha: str | None = Field(default=None, min_length=7, max_length=64)
     approved_protected_paths: list[str] = Field(default_factory=list)
     clarification_answers: str | None = Field(default=None, max_length=4000)
@@ -37,22 +39,26 @@ class HumanDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_requirements(self) -> "HumanDecision":
-        if self.action == "approve" and \
-        (not self.approved_plan_hash or not self.approved_base_commit_sha):
-            raise ValueError(
-                "Plan approval must bind explicitly to both approved_plan_hash "
-                "and approved_base_commit_sha."
-            )
-        elif self.action == "clarify" and \
-        (not self.clarification_answers or not self.clarification_answers.strip()):
-            raise ValueError(
-                "clarification_answers must be non-empty when action is 'clarify'."
-            )
+        if self.action == "approve":
+            if not self.approved_base_commit_sha:
+                raise ValueError(
+                    "Approval must bind explicitly to approved_base_commit_sha."
+                )
+            if not self.approved_plan_hash and not self.approved_patch_hash:
+                raise ValueError(
+                    "Approval must bind explicitly to either approved_plan_hash "
+                    "or approved_patch_hash."
+                )
+        elif self.action == "clarify":
+            if not self.clarification_answers or not self.clarification_answers.strip():
+                raise ValueError(
+                    "clarification_answers must be non-empty when action is 'clarify'."
+                )
         return self
 
 
 class WorkflowState(TypedDict, total=False):
-    """Typed, checkpoint-serializable LangGraph state for the vertical-slice workflow."""
+    """Typed, checkpoint-serializable LangGraph state for the SDLC workflow."""
 
     state_schema_version: str
     workflow_id: str
@@ -61,6 +67,7 @@ class WorkflowState(TypedDict, total=False):
     repository_full_name: str
     is_private_repo: bool
     llm_data_sharing: bool
+    tracing_enabled: bool
     base_branch: str
     base_commit_sha: str
     workspace_dir: str
@@ -78,6 +85,11 @@ class WorkflowState(TypedDict, total=False):
     clarification_attempts: int
     clarification_answers: str | None
 
+    test_correction_loops: int
+    review_correction_loops: int
+    total_correction_loops: int
+    pending_correction_feedback: str | None
+
     requirement_spec: dict[str, Any] | None
     repo_analysis: dict[str, Any] | None
     technical_design: dict[str, Any] | None
@@ -87,11 +99,22 @@ class WorkflowState(TypedDict, total=False):
     plan_approval_record: dict[str, Any] | None
     approved_protected_paths: list[str]
 
+    touched_files: list[str]
     coding_output: dict[str, Any] | None
     patch_validation: dict[str, Any] | None
     patch_apply_result: dict[str, Any] | None
+    patch_hash: str | None
     sandbox_report: dict[str, Any] | None
+    static_analysis_summary: str | None
+    last_test_diagnosis: dict[str, Any] | None
+    code_review_report: dict[str, Any] | None
 
+    commit_approved: bool
+    commit_approval_record: dict[str, Any] | None
+    release_output: dict[str, Any] | None
+
+    cancelled_by: str | None
+    cancel_reason: str | None
     usage_records: list[dict[str, Any]]
     node_history: list[str]
     error_code: str | None
@@ -99,7 +122,7 @@ class WorkflowState(TypedDict, total=False):
 
 
 class WorkflowExecutionSnapshot(BaseModel):
-    """Read-only summary returned after starting, resuming, or reconciling a workflow."""
+    """Read-only summary returned after starting, resuming, cancelling, or reconciling."""
 
     workflow_id: str
     thread_id: str
@@ -108,15 +131,22 @@ class WorkflowExecutionSnapshot(BaseModel):
     current_node: str | None = None
     base_commit_sha: str
     plan_hash: str | None = None
+    patch_hash: str | None = None
     interrupted: bool = False
     interrupt_payload: dict[str, Any] | None = None
     reused_existing: bool = False
+    tracing_enabled: bool = False
     llm_calls_count: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
     estimated_cost_usd: str = "0.000000"
     cost_status: str = "unavailable"
+    test_correction_loops: int = Field(default=0, ge=0)
+    review_correction_loops: int = Field(default=0, ge=0)
+    total_correction_loops: int = Field(default=0, ge=0)
     sandbox_passed: bool | None = None
-    patch_hash: str | None = None
+    review_passed: bool | None = None
+    commit_approved: bool = False
+    pr_title: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     node_history: list[str] = Field(default_factory=list)

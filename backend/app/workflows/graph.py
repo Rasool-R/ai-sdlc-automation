@@ -1,12 +1,15 @@
-"""Deterministic LangGraph StateGraph orchestrator for the Phase 4 vertical slice.
+"""Deterministic LangGraph StateGraph orchestrating the full seven-agent SDLC workflow.
 
 Architecture invariants:
 - LangGraph checkpoints are the single source of truth for execution state.
 - WorkflowRunModel is an application-level projection synced idempotently at transitions.
 - Routing is strictly deterministic Python (no LLM-based Supervisor).
-- Human approval interrupts checkpoint state and bind to (plan_hash, base_commit_sha).
+- Human approvals bind explicitly to (plan_hash, base_commit_sha) and (patch_hash, base_commit_sha).
+- Bounded correction loops guarantee infinite retries are impossible.
 """
 
+import difflib
+import hashlib
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -14,22 +17,27 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from git import InvalidGitRepositoryError, Repo
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents.code_review_agent import CodeReviewAgent
 from app.agents.coding_agent import CodingAgent
 from app.agents.planning_agent import PlanningAgent
+from app.agents.release_agent import ReleaseAgent
 from app.agents.repository_analysis_agent import RepositoryAnalysisAgent
 from app.agents.requirement_agent import RequirementAnalysisAgent
 from app.agents.schemas import (
+    CodeReviewReport,
     ImplementationPlan,
     RepositoryAnalysisReport,
     RequirementSpecification,
     TechnicalDesign,
 )
+from app.agents.testing_agent import TestingAgent
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AppError,
@@ -37,12 +45,20 @@ from app.core.exceptions import (
     ResourceNotFoundError,
     ValidationFailedError,
 )
-from app.execution.patch_service import PatchService
-from app.execution.sandbox_client import SandboxClient
+from app.execution.patch_service import PatchService, classify_protected_path
+from app.execution.sandbox_client import SandboxClient, SandboxRunReport
+from app.execution.schemas import (
+    PatchOperationType,
+    PatchValidationResult,
+    ProtectedPathFlag,
+    TestIntegrityFlag,
+)
+from app.execution.test_integrity import inspect_test_integrity
 from app.integrations.llm.client import LLMClient, LLMUsageMetrics
 from app.intelligence.retrieval import HybridRetrievalService
 from app.models.repository import RepositoryModel
 from app.models.workflow import WorkflowRunModel
+from app.observability.tracing import build_langgraph_run_config
 from app.services.audit_service import AuditService
 from app.workflows.state import (
     WORKFLOW_STATE_SCHEMA_VERSION,
@@ -56,10 +72,17 @@ from app.workflows.state import (
 logger = logging.getLogger(__name__)
 
 MAX_CLARIFICATION_ATTEMPTS = 2
+_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "rejected", "cancelled"}
+)
 
 
 def _append_history(state: WorkflowState, node_name: str) -> list[str]:
     return [*state.get("node_history", []), node_name]
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _accumulate_usage(state: WorkflowState, usage: LLMUsageMetrics) -> dict[str, Any]:
@@ -118,6 +141,188 @@ def _check_budget_limits(state: WorkflowState, settings: Settings) -> tuple[str,
     return None
 
 
+def _compute_cumulative_validation(
+    *,
+    workspace_dir: Path,
+    base_commit_sha: str,
+    touched_files: list[str],
+    expected_files: list[str],
+    declared_protected_paths: list[str],
+    approved_protected_paths: list[str],
+    plan_declares_dependency_change: bool,
+    settings: Settings,
+) -> PatchValidationResult:
+    """Compute net cumulative diff, flags, and patch_hash against immutable base_commit_sha."""
+    root = workspace_dir.resolve()
+    try:
+        repo = Repo(str(root))
+    except InvalidGitRepositoryError as exc:
+        raise ValidationFailedError(
+            "Workspace is not a valid Git repository.",
+            details={"workspace_dir": str(root)},
+        ) from exc
+
+    try:
+        head_sha = str(repo.head.commit.hexsha)
+        if head_sha != base_commit_sha:
+            raise ConflictError(
+                "Workspace HEAD drifted from workflow base_commit_sha.",
+                details={"expected_base_sha": base_commit_sha, "actual_base_sha": head_sha},
+            )
+
+        expected_set = set(expected_files)
+        declared_protected_set = set(declared_protected_paths)
+        approved_protected_set = set(approved_protected_paths)
+
+        diff_chunks: list[str] = []
+        changed_files: list[str] = []
+        scope_drift_files: list[str] = []
+        protected_flags: list[ProtectedPathFlag] = []
+        test_integrity_flags: list[TestIntegrityFlag] = []
+        lines_added = 0
+        lines_removed = 0
+
+        for rel_path in sorted(set(touched_files)):
+            old_text: str | None = None
+            try:
+                blob = repo.head.commit.tree / rel_path
+                raw_old = bytes(blob.data_stream.read())
+                old_text = _normalize_newlines(raw_old.decode("utf-8"))
+            except KeyError:
+                old_text = None
+
+            disk_path = (root / rel_path).resolve()
+            new_text: str | None = None
+            if disk_path.is_relative_to(root) and disk_path.is_file():
+                new_text = _normalize_newlines(disk_path.read_text(encoding="utf-8"))
+
+            if old_text == new_text:
+                continue
+
+            changed_files.append(rel_path)
+            if rel_path not in expected_set:
+                scope_drift_files.append(rel_path)
+
+            operation: PatchOperationType
+            if old_text is None:
+                operation = "create"
+            elif new_text is None:
+                operation = "delete"
+            else:
+                operation = "modify"
+
+            protected_match = classify_protected_path(rel_path)
+            if protected_match is not None:
+                category, reason = protected_match
+                is_declared = rel_path in declared_protected_set or (
+                    category == "dependency_manifest" and plan_declares_dependency_change
+                )
+                protected_flags.append(
+                    ProtectedPathFlag(
+                        file_path=rel_path,
+                        category=category,
+                        reason=reason,
+                        declared_in_plan=is_declared,
+                        approved=rel_path in approved_protected_set,
+                    )
+                )
+
+            test_integrity_flags.extend(
+                inspect_test_integrity(
+                    file_path=rel_path,
+                    operation=operation,
+                    old_content=old_text,
+                    new_content=new_text,
+                )
+            )
+
+            old_lines = old_text.splitlines(keepends=True) if old_text is not None else []
+            new_lines = new_text.splitlines(keepends=True) if new_text is not None else []
+            fromfile = "/dev/null" if operation == "create" else f"a/{rel_path}"
+            tofile = "/dev/null" if operation == "delete" else f"b/{rel_path}"
+            file_diff = list(
+                difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=fromfile,
+                    tofile=tofile,
+                    lineterm="\n",
+                )
+            )
+            for line in file_diff:
+                if line.startswith("+") and not line.startswith("+++"):
+                    lines_added += 1
+                elif line.startswith("-") and not line.startswith("---"):
+                    lines_removed += 1
+            if file_diff:
+                diff_chunks.append(
+                    "".join(line if line.endswith("\n") else f"{line}\n" for line in file_diff)
+                )
+    finally:
+        repo.close()
+
+    unified_diff = "".join(diff_chunks)
+    total_changed_lines = lines_added + lines_removed
+    errors: list[str] = []
+
+    if len(changed_files) > settings.MAX_FILES_PER_PATCH:
+        errors.append(
+            f"Cumulative changes touch {len(changed_files)} files, exceeding limit "
+            f"{settings.MAX_FILES_PER_PATCH}."
+        )
+    if total_changed_lines > settings.MAX_LINES_PER_PATCH:
+        errors.append(
+            f"Cumulative changes span {total_changed_lines} lines, exceeding limit "
+            f"{settings.MAX_LINES_PER_PATCH}."
+        )
+
+    unapproved_protected = [
+        f for f in protected_flags if not (f.declared_in_plan and f.approved)
+    ]
+    if unapproved_protected:
+        errors.append(
+            "Cumulative patch touches protected path(s) without plan declaration and approval."
+        )
+    if test_integrity_flags:
+        errors.append("Cumulative patch triggers test-integrity warning(s).")
+
+    patch_hash = hashlib.sha256(
+        f"{base_commit_sha}\n{unified_diff}".encode()
+    ).hexdigest()
+    return PatchValidationResult(
+        valid=len(errors) == 0,
+        base_commit_sha=base_commit_sha,
+        patch_hash=patch_hash,
+        unified_diff=unified_diff,
+        files_changed=changed_files,
+        lines_added=lines_added,
+        lines_removed=lines_removed,
+        total_changed_lines=total_changed_lines,
+        protected_path_flags=protected_flags,
+        scope_drift_files=scope_drift_files,
+        test_integrity_flags=test_integrity_flags,
+        requires_human_approval=bool(unapproved_protected or test_integrity_flags),
+        errors=errors,
+    )
+
+
+def _format_review_correction_feedback(report: CodeReviewReport) -> str:
+    lines: list[str] = [
+        "Code Review failed. Address ALL blocking defects and re-verify:",
+        f"Review Summary: {report.summary}",
+    ]
+    if report.blocking_reasons:
+        lines.append("Blocking Reasons:")
+        lines.extend(f"- {reason}" for reason in report.blocking_reasons)
+    for finding in report.findings:
+        if finding.severity in {"Critical", "High", "Medium"}:
+            lines.append(
+                f"- [{finding.severity}/{finding.classification}] {finding.file_path}: "
+                f"{finding.title} -> {finding.recommendation}"
+            )
+    return "\n".join(lines)
+
+
 def _extract_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
     """Inspect a LangGraph StateSnapshot for an active human interrupt payload."""
     tasks = getattr(snapshot, "tasks", ()) or ()
@@ -135,6 +340,12 @@ def _derive_status_from_snapshot(
 ) -> tuple[str, str | None, bool, dict[str, Any] | None]:
     """Derive authoritative projection status and node from a LangGraph checkpoint snapshot."""
     values: dict[str, Any] = dict(getattr(snapshot, "values", {}) or {})
+    current_node_val = values.get("current_node")
+    current_node = str(current_node_val) if current_node_val is not None else None
+
+    if values.get("status") == "cancelled":
+        return "cancelled", current_node, False, None
+
     pending_next = tuple(getattr(snapshot, "next", ()) or ())
     interrupt_payload = _extract_interrupt_payload(snapshot)
     is_interrupted = bool(pending_next)
@@ -145,15 +356,16 @@ def _derive_status_from_snapshot(
             return "waiting_clarification", "human_clarification", True, interrupt_payload
         if intr_type == "plan_approval_required":
             return "waiting_plan_approval", "human_plan_approval", True, interrupt_payload
-        next_node = str(pending_next[0]) if pending_next else values.get("current_node")
+        if intr_type == "commit_approval_required":
+            return "waiting_commit_approval", "human_commit_approval", True, interrupt_payload
+        next_node = str(pending_next[0]) if pending_next else current_node
         return "running", next_node, True, interrupt_payload
 
     status = str(values.get("status", "failed"))
-    current_node = values.get("current_node")
-    return status, str(current_node) if current_node is not None else None, False, None
+    return status, current_node, False, None
 
 
-def build_vertical_slice_graph(
+def build_sdlc_workflow_graph(
     *,
     db: Session,
     llm_client: LLMClient,
@@ -163,12 +375,15 @@ def build_vertical_slice_graph(
     checkpointer: Any,
     settings: Settings | None = None,
 ) -> Any:
-    """Compile the deterministic Phase 4 vertical-slice LangGraph StateGraph."""
+    """Compile the deterministic seven-agent SDLC LangGraph StateGraph."""
     resolved_settings = settings or get_settings()
     req_agent = RequirementAnalysisAgent(llm_client)
     repo_agent = RepositoryAnalysisAgent(llm_client, retrieval_service)
     plan_agent = PlanningAgent(llm_client)
     coding_agent = CodingAgent(llm_client, patch_service)
+    testing_agent = TestingAgent(llm_client)
+    review_agent = CodeReviewAgent(llm_client)
+    release_agent = ReleaseAgent(llm_client)
 
     def requirement_analysis_node(state: WorkflowState) -> dict[str, Any]:
         budget_violation = _check_budget_limits(state, resolved_settings)
@@ -209,14 +424,13 @@ def build_vertical_slice_graph(
         }
 
     def route_after_requirement(state: WorkflowState) -> str:
-        if state.get("status") == "failed":
+        if state.get("status") in _TERMINAL_STATUSES:
             return "end"
         raw_spec = state.get("requirement_spec")
         if not raw_spec:
             return "end"
         if bool(raw_spec.get("needs_clarification")):
-            attempts = int(state.get("clarification_attempts", 0))
-            if attempts >= MAX_CLARIFICATION_ATTEMPTS:
+            if int(state.get("clarification_attempts", 0)) >= MAX_CLARIFICATION_ATTEMPTS:
                 return "fail_clarification_limit"
             return "human_clarification"
         return "repository_analysis"
@@ -227,7 +441,7 @@ def build_vertical_slice_graph(
             "current_node": "fail_clarification_limit",
             "error_code": "CLARIFICATION_LIMIT_EXCEEDED",
             "error_message": (
-                f"Requirement still ambiguous after {MAX_CLARIFICATION_ATTEMPTS} "
+                f"Requirement remained ambiguous after {MAX_CLARIFICATION_ATTEMPTS} "
                 "clarification attempt(s)."
             ),
             "node_history": _append_history(state, "fail_clarification_limit"),
@@ -288,7 +502,7 @@ def build_vertical_slice_graph(
         }
 
     def route_after_clarification(state: WorkflowState) -> str:
-        if state.get("status") in {"failed", "rejected"}:
+        if state.get("status") in _TERMINAL_STATUSES:
             return "end"
         return "requirement_analysis"
 
@@ -345,7 +559,7 @@ def build_vertical_slice_graph(
 
     def route_if_running(next_node: str) -> Any:
         def _router(state: WorkflowState) -> str:
-            if state.get("status") in {"failed", "rejected", "cancelled"}:
+            if state.get("status") in _TERMINAL_STATUSES:
                 return "end"
             return next_node
 
@@ -452,7 +666,6 @@ def build_vertical_slice_graph(
                 "node_history": _append_history(state, "human_plan_approval"),
             }
 
-        # Safety Invariant: approval must bind strictly to exact plan_hash and base_commit_sha
         if (
             decision.approved_plan_hash != state.get("plan_hash")
             or decision.approved_base_commit_sha != state["base_commit_sha"]
@@ -514,6 +727,7 @@ def build_vertical_slice_graph(
             plan = ImplementationPlan.model_validate(state["implementation_plan"])
             approved_protected = list(state.get("approved_protected_paths", []))
             workspace_path = Path(state["workspace_dir"])
+            feedback = state.get("pending_correction_feedback")
 
             coding_res = coding_agent.run(
                 workspace_dir=workspace_path,
@@ -522,6 +736,7 @@ def build_vertical_slice_graph(
                 plan=plan,
                 is_private_repo=state["is_private_repo"],
                 llm_data_sharing=state["llm_data_sharing"],
+                feedback=feedback,
                 approved_protected_paths=approved_protected,
             )
         except (AppError, ValidationError) as exc:
@@ -559,6 +774,19 @@ def build_vertical_slice_graph(
                 approved_protected_paths=approved_protected,
                 plan_declares_dependency_change=plan.declares_dependency_change,
             )
+            merged_touched = sorted(
+                set(state.get("touched_files", [])).union(applied.files_changed)
+            )
+            cumulative_validation = _compute_cumulative_validation(
+                workspace_dir=workspace_path,
+                base_commit_sha=state["base_commit_sha"],
+                touched_files=merged_touched,
+                expected_files=plan.expected_files,
+                declared_protected_paths=plan.declared_protected_paths,
+                approved_protected_paths=approved_protected,
+                plan_declares_dependency_change=plan.declares_dependency_change,
+                settings=resolved_settings,
+            )
         except AppError as exc:
             return {
                 **usage_update,
@@ -571,13 +799,32 @@ def build_vertical_slice_graph(
                 "node_history": _append_history(state, "coding"),
             }
 
+        if not cumulative_validation.valid:
+            return {
+                **usage_update,
+                "status": "failed",
+                "current_node": "coding",
+                "touched_files": merged_touched,
+                "coding_output": coding_res.output.model_dump(mode="json"),
+                "patch_validation": cumulative_validation.model_dump(mode="json"),
+                "patch_apply_result": applied.model_dump(mode="json"),
+                "patch_hash": cumulative_validation.patch_hash,
+                "error_code": "PATCH_VALIDATION_FAILED",
+                "error_message": "; ".join(cumulative_validation.errors),
+                "node_history": _append_history(state, "coding"),
+            }
+
         return {
             **usage_update,
             "status": "running",
             "current_node": "coding",
+            "pending_correction_feedback": None,
+            "commit_approved": False,
+            "touched_files": merged_touched,
             "coding_output": coding_res.output.model_dump(mode="json"),
-            "patch_validation": coding_res.validation.model_dump(mode="json"),
+            "patch_validation": cumulative_validation.model_dump(mode="json"),
             "patch_apply_result": applied.model_dump(mode="json"),
+            "patch_hash": cumulative_validation.patch_hash,
             "node_history": _append_history(state, "coding"),
         }
 
@@ -598,21 +845,332 @@ def build_vertical_slice_graph(
                 "node_history": _append_history(state, "sandbox_test"),
             }
 
-        if not report.passed:
-            return {
-                "status": "failed",
-                "current_node": "sandbox_test",
-                "sandbox_report": report.model_dump(mode="json"),
-                "error_code": "SANDBOX_TESTS_FAILED",
-                "error_message": "Isolated sandbox test execution failed.",
-                "node_history": _append_history(state, "sandbox_test"),
-            }
-
         return {
-            "status": "completed",
+            "status": "running",
             "current_node": "sandbox_test",
             "sandbox_report": report.model_dump(mode="json"),
             "node_history": _append_history(state, "sandbox_test"),
+        }
+
+    def route_after_sandbox_test(state: WorkflowState) -> str:
+        if state.get("status") in _TERMINAL_STATUSES:
+            return "end"
+        sandbox_raw = state.get("sandbox_report")
+        if isinstance(sandbox_raw, dict) and bool(sandbox_raw.get("passed")):
+            return "code_review"
+        return "test_failure_analysis"
+
+    def test_failure_analysis_node(state: WorkflowState) -> dict[str, Any]:
+        test_loops = int(state.get("test_correction_loops", 0))
+        total_loops = int(state.get("total_correction_loops", 0))
+        if (
+            test_loops >= resolved_settings.MAX_CORRECTION_LOOPS_PER_FAILURE
+            or total_loops >= resolved_settings.MAX_CORRECTION_LOOPS_PER_WORKFLOW
+        ):
+            return {
+                "status": "failed",
+                "current_node": "test_failure_analysis",
+                "error_code": "CORRECTION_LIMIT_EXCEEDED",
+                "error_message": (
+                    "Test failure correction loop limit reached "
+                    f"(test_loops={test_loops}, total_loops={total_loops})."
+                ),
+                "node_history": _append_history(state, "test_failure_analysis"),
+            }
+
+        budget_violation = _check_budget_limits(state, resolved_settings)
+        if budget_violation is not None:
+            return {
+                "status": "failed",
+                "current_node": "test_failure_analysis",
+                "error_code": budget_violation[0],
+                "error_message": budget_violation[1],
+                "node_history": _append_history(state, "test_failure_analysis"),
+            }
+
+        try:
+            requirement = RequirementSpecification.model_validate(state["requirement_spec"])
+            plan = ImplementationPlan.model_validate(state["implementation_plan"])
+            patch_val = PatchValidationResult.model_validate(state["patch_validation"])
+            sandbox_rep = SandboxRunReport.model_validate(state["sandbox_report"])
+            result = testing_agent.analyze_failure(
+                requirement=requirement,
+                plan=plan,
+                raw_diff=patch_val.unified_diff,
+                sandbox_report=sandbox_rep,
+                is_private_repo=state["is_private_repo"],
+                llm_data_sharing=state["llm_data_sharing"],
+                attempt_number=test_loops + 1,
+            )
+        except (AppError, ValidationError) as exc:
+            err_code = exc.code if isinstance(exc, AppError) else "STATE_VALIDATION_ERROR"
+            err_msg = exc.message if isinstance(exc, AppError) else str(exc)
+            return {
+                "status": "failed",
+                "current_node": "test_failure_analysis",
+                "error_code": err_code,
+                "error_message": err_msg,
+                "node_history": _append_history(state, "test_failure_analysis"),
+            }
+
+        usage_update = _accumulate_usage(state, result.usage)
+        if not result.diagnosis.is_fixable_by_coding_agent:
+            return {
+                **usage_update,
+                "status": "failed",
+                "current_node": "test_failure_analysis",
+                "last_test_diagnosis": result.diagnosis.model_dump(mode="json"),
+                "error_code": "UNFIXABLE_TEST_FAILURE",
+                "error_message": result.diagnosis.summary,
+                "node_history": _append_history(state, "test_failure_analysis"),
+            }
+
+        return {
+            **usage_update,
+            "status": "running",
+            "current_node": "test_failure_analysis",
+            "last_test_diagnosis": result.diagnosis.model_dump(mode="json"),
+            "test_correction_loops": test_loops + 1,
+            "total_correction_loops": total_loops + 1,
+            "pending_correction_feedback": (
+                f"Test failure diagnosis ({result.diagnosis.failure_category}): "
+                f"{result.diagnosis.root_cause}\n"
+                f"Correction instructions: {result.diagnosis.correction_instructions}"
+            ),
+            "node_history": _append_history(state, "test_failure_analysis"),
+        }
+
+    def code_review_node(state: WorkflowState) -> dict[str, Any]:
+        budget_violation = _check_budget_limits(state, resolved_settings)
+        if budget_violation is not None:
+            return {
+                "status": "failed",
+                "current_node": "code_review",
+                "error_code": budget_violation[0],
+                "error_message": budget_violation[1],
+                "node_history": _append_history(state, "code_review"),
+            }
+
+        try:
+            requirement = RequirementSpecification.model_validate(state["requirement_spec"])
+            plan = ImplementationPlan.model_validate(state["implementation_plan"])
+            patch_val = PatchValidationResult.model_validate(state["patch_validation"])
+            sandbox_rep = SandboxRunReport.model_validate(state["sandbox_report"])
+            result = review_agent.run(
+                requirement=requirement,
+                plan=plan,
+                patch_validation=patch_val,
+                sandbox_report=sandbox_rep,
+                static_analysis_summary=state.get("static_analysis_summary"),
+                is_private_repo=state["is_private_repo"],
+                llm_data_sharing=state["llm_data_sharing"],
+            )
+        except (AppError, ValidationError) as exc:
+            err_code = exc.code if isinstance(exc, AppError) else "STATE_VALIDATION_ERROR"
+            err_msg = exc.message if isinstance(exc, AppError) else str(exc)
+            return {
+                "status": "failed",
+                "current_node": "code_review",
+                "error_code": err_code,
+                "error_message": err_msg,
+                "node_history": _append_history(state, "code_review"),
+            }
+
+        usage_update = _accumulate_usage(state, result.usage)
+        if result.report.passed:
+            return {
+                **usage_update,
+                "status": "running",
+                "current_node": "code_review",
+                "code_review_report": result.report.model_dump(mode="json"),
+                "pending_correction_feedback": None,
+                "node_history": _append_history(state, "code_review"),
+            }
+
+        review_loops = int(state.get("review_correction_loops", 0))
+        total_loops = int(state.get("total_correction_loops", 0))
+        if (
+            review_loops >= resolved_settings.MAX_CORRECTION_LOOPS_PER_FAILURE
+            or total_loops >= resolved_settings.MAX_CORRECTION_LOOPS_PER_WORKFLOW
+        ):
+            return {
+                **usage_update,
+                "status": "failed",
+                "current_node": "code_review",
+                "code_review_report": result.report.model_dump(mode="json"),
+                "error_code": "CORRECTION_LIMIT_EXCEEDED",
+                "error_message": (
+                    "Code review correction loop limit reached "
+                    f"(review_loops={review_loops}, total_loops={total_loops})."
+                ),
+                "node_history": _append_history(state, "code_review"),
+            }
+
+        return {
+            **usage_update,
+            "status": "running",
+            "current_node": "code_review",
+            "code_review_report": result.report.model_dump(mode="json"),
+            "review_correction_loops": review_loops + 1,
+            "total_correction_loops": total_loops + 1,
+            "pending_correction_feedback": _format_review_correction_feedback(result.report),
+            "node_history": _append_history(state, "code_review"),
+        }
+
+    def route_after_code_review(state: WorkflowState) -> str:
+        if state.get("status") in _TERMINAL_STATUSES:
+            return "end"
+        review_raw = state.get("code_review_report")
+        if isinstance(review_raw, dict) and bool(review_raw.get("passed")):
+            return "human_commit_approval"
+        return "coding"
+
+    def human_commit_approval_node(state: WorkflowState) -> dict[str, Any]:
+        patch_val = state.get("patch_validation") or {}
+        decision_raw = interrupt(
+            {
+                "type": "commit_approval_required",
+                "workflow_id": state["workflow_id"],
+                "base_commit_sha": state["base_commit_sha"],
+                "patch_hash": state.get("patch_hash"),
+                "raw_diff": patch_val.get("unified_diff", ""),
+                "files_changed": list(patch_val.get("files_changed", [])),
+                "protected_path_flags": list(patch_val.get("protected_path_flags", [])),
+                "test_integrity_flags": list(patch_val.get("test_integrity_flags", [])),
+                "scope_drift_files": list(patch_val.get("scope_drift_files", [])),
+                "sandbox_report": state.get("sandbox_report"),
+                "code_review_report": state.get("code_review_report"),
+                "estimated_cost_usd": state.get("estimated_cost_usd", "0.000000"),
+                "cost_status": state.get("cost_status", "unavailable"),
+            }
+        )
+
+        try:
+            decision = HumanDecision.model_validate(decision_raw)
+        except ValidationError as exc:
+            return {
+                "status": "failed",
+                "current_node": "human_commit_approval",
+                "error_code": "INVALID_HUMAN_DECISION",
+                "error_message": f"Invalid commit approval payload: {exc.error_count()} error(s).",
+                "node_history": _append_history(state, "human_commit_approval"),
+            }
+
+        if decision.action == "reject":
+            return {
+                "status": "rejected",
+                "current_node": "human_commit_approval",
+                "commit_approved": False,
+                "commit_approval_record": {
+                    "action": "reject",
+                    "actor": decision.actor,
+                    "reason": decision.reason,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                    "patch_hash": state.get("patch_hash"),
+                    "base_commit_sha": state["base_commit_sha"],
+                },
+                "node_history": _append_history(state, "human_commit_approval"),
+            }
+
+        if decision.action != "approve":
+            return {
+                "status": "failed",
+                "current_node": "human_commit_approval",
+                "error_code": "UNEXPECTED_HUMAN_ACTION",
+                "error_message": f"Expected 'approve' or 'reject', got '{decision.action}'.",
+                "node_history": _append_history(state, "human_commit_approval"),
+            }
+
+        if (
+            decision.approved_patch_hash != state.get("patch_hash")
+            or decision.approved_base_commit_sha != state["base_commit_sha"]
+        ):
+            return {
+                "status": "failed",
+                "current_node": "human_commit_approval",
+                "commit_approved": False,
+                "error_code": "APPROVAL_BINDING_MISMATCH",
+                "error_message": (
+                    "Commit/PR approval patch_hash or base_commit_sha does not match current state."
+                ),
+                "node_history": _append_history(state, "human_commit_approval"),
+            }
+
+        return {
+            "status": "running",
+            "current_node": "human_commit_approval",
+            "commit_approved": True,
+            "commit_approval_record": {
+                "action": "approve",
+                "actor": decision.actor,
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "patch_hash": state.get("patch_hash"),
+                "base_commit_sha": state["base_commit_sha"],
+            },
+            "node_history": _append_history(state, "human_commit_approval"),
+        }
+
+    def route_after_commit_approval(state: WorkflowState) -> str:
+        if state.get("commit_approved") is True and state.get("status") == "running":
+            return "release_preparation"
+        return "end"
+
+    def release_preparation_node(state: WorkflowState) -> dict[str, Any]:
+        if state.get("commit_approved") is not True:
+            return {
+                "status": "failed",
+                "current_node": "release_preparation",
+                "error_code": "COMMIT_APPROVAL_REQUIRED",
+                "error_message": "Release preparation requires recorded human Commit/PR approval.",
+                "node_history": _append_history(state, "release_preparation"),
+            }
+
+        budget_violation = _check_budget_limits(state, resolved_settings)
+        if budget_violation is not None:
+            return {
+                "status": "failed",
+                "current_node": "release_preparation",
+                "error_code": budget_violation[0],
+                "error_message": budget_violation[1],
+                "node_history": _append_history(state, "release_preparation"),
+            }
+
+        try:
+            requirement = RequirementSpecification.model_validate(state["requirement_spec"])
+            plan = ImplementationPlan.model_validate(state["implementation_plan"])
+            patch_val = PatchValidationResult.model_validate(state["patch_validation"])
+            sandbox_rep = SandboxRunReport.model_validate(state["sandbox_report"])
+            review_rep = CodeReviewReport.model_validate(state["code_review_report"])
+            result = release_agent.run(
+                repository_full_name=state["repository_full_name"],
+                base_branch=state["base_branch"],
+                requirement=requirement,
+                plan=plan,
+                patch_validation=patch_val,
+                sandbox_report=sandbox_rep,
+                review_report=review_rep,
+                static_analysis_summary=state.get("static_analysis_summary"),
+                is_private_repo=state["is_private_repo"],
+                llm_data_sharing=state["llm_data_sharing"],
+            )
+        except (AppError, ValidationError) as exc:
+            err_code = exc.code if isinstance(exc, AppError) else "STATE_VALIDATION_ERROR"
+            err_msg = exc.message if isinstance(exc, AppError) else str(exc)
+            return {
+                "status": "failed",
+                "current_node": "release_preparation",
+                "error_code": err_code,
+                "error_message": err_msg,
+                "node_history": _append_history(state, "release_preparation"),
+            }
+
+        usage_update = _accumulate_usage(state, result.usage)
+        return {
+            **usage_update,
+            "status": "completed",
+            "current_node": "release_preparation",
+            "release_output": result.output.model_dump(mode="json"),
+            "node_history": _append_history(state, "release_preparation"),
         }
 
     graph_builder = StateGraph(WorkflowState)
@@ -624,6 +1182,10 @@ def build_vertical_slice_graph(
     graph_builder.add_node("human_plan_approval", human_plan_approval_node)
     graph_builder.add_node("coding", coding_node)
     graph_builder.add_node("sandbox_test", sandbox_test_node)
+    graph_builder.add_node("test_failure_analysis", test_failure_analysis_node)
+    graph_builder.add_node("code_review", code_review_node)
+    graph_builder.add_node("human_commit_approval", human_commit_approval_node)
+    graph_builder.add_node("release_preparation", release_preparation_node)
 
     graph_builder.add_edge(START, "requirement_analysis")
     graph_builder.add_conditional_edges(
@@ -640,10 +1202,7 @@ def build_vertical_slice_graph(
     graph_builder.add_conditional_edges(
         "human_clarification",
         route_after_clarification,
-        {
-            "requirement_analysis": "requirement_analysis",
-            "end": END,
-        },
+        {"requirement_analysis": "requirement_analysis", "end": END},
     )
     graph_builder.add_conditional_edges(
         "repository_analysis",
@@ -665,13 +1224,41 @@ def build_vertical_slice_graph(
         route_if_running("sandbox_test"),
         {"sandbox_test": "sandbox_test", "end": END},
     )
-    graph_builder.add_edge("sandbox_test", END)
+    graph_builder.add_conditional_edges(
+        "sandbox_test",
+        route_after_sandbox_test,
+        {
+            "code_review": "code_review",
+            "test_failure_analysis": "test_failure_analysis",
+            "end": END,
+        },
+    )
+    graph_builder.add_conditional_edges(
+        "test_failure_analysis",
+        route_if_running("coding"),
+        {"coding": "coding", "end": END},
+    )
+    graph_builder.add_conditional_edges(
+        "code_review",
+        route_after_code_review,
+        {
+            "human_commit_approval": "human_commit_approval",
+            "coding": "coding",
+            "end": END,
+        },
+    )
+    graph_builder.add_conditional_edges(
+        "human_commit_approval",
+        route_after_commit_approval,
+        {"release_preparation": "release_preparation", "end": END},
+    )
+    graph_builder.add_edge("release_preparation", END)
 
     return graph_builder.compile(checkpointer=checkpointer)
 
 
-class VerticalSliceOrchestrator:
-    """Runs and resumes vertical-slice workflows while keeping WorkflowRunModel in sync."""
+class WorkflowOrchestrator:
+    """Runs, resumes, cancels, and reconciles workflows while keeping projections in sync."""
 
     def __init__(
         self,
@@ -687,7 +1274,7 @@ class VerticalSliceOrchestrator:
         self._db = db
         self._settings = settings or get_settings()
         self._audit = AuditService(db)
-        self._graph = build_vertical_slice_graph(
+        self._graph = build_sdlc_workflow_graph(
             db=db,
             llm_client=llm_client,
             retrieval_service=retrieval_service,
@@ -712,12 +1299,22 @@ class VerticalSliceOrchestrator:
         sandbox_passed = (
             bool(sandbox_raw.get("passed")) if isinstance(sandbox_raw, dict) else None
         )
-        patch_apply_raw = values.get("patch_apply_result")
-        patch_hash = (
-            str(patch_apply_raw.get("patch_hash"))
-            if isinstance(patch_apply_raw, dict) and patch_apply_raw.get("patch_hash")
+        review_raw = values.get("code_review_report")
+        review_passed = (
+            bool(review_raw.get("passed")) if isinstance(review_raw, dict) else None
+        )
+        release_raw = values.get("release_output")
+        pr_title = (
+            str(release_raw.get("pr_title"))
+            if isinstance(release_raw, dict) and release_raw.get("pr_title")
             else None
         )
+        patch_hash_val = values.get("patch_hash")
+        if not patch_hash_val:
+            patch_apply_raw = values.get("patch_apply_result")
+            if isinstance(patch_apply_raw, dict):
+                patch_hash_val = patch_apply_raw.get("patch_hash")
+
         return WorkflowExecutionSnapshot(
             workflow_id=run.id,
             thread_id=run.thread_id,
@@ -728,15 +1325,22 @@ class VerticalSliceOrchestrator:
             current_node=current_node,
             base_commit_sha=run.base_commit_sha,
             plan_hash=str(values["plan_hash"]) if values.get("plan_hash") else None,
+            patch_hash=str(patch_hash_val) if patch_hash_val else None,
             interrupted=interrupted,
             interrupt_payload=interrupt_payload,
             reused_existing=reused_existing,
+            tracing_enabled=bool(values.get("tracing_enabled", False)),
             llm_calls_count=int(values.get("llm_calls_count", 0)),
             total_tokens=int(values.get("total_tokens", 0)),
             estimated_cost_usd=str(values.get("estimated_cost_usd", "0.000000")),
             cost_status=str(values.get("cost_status", "unavailable")),
+            test_correction_loops=int(values.get("test_correction_loops", 0)),
+            review_correction_loops=int(values.get("review_correction_loops", 0)),
+            total_correction_loops=int(values.get("total_correction_loops", 0)),
             sandbox_passed=sandbox_passed,
-            patch_hash=patch_hash,
+            review_passed=review_passed,
+            commit_approved=bool(values.get("commit_approved", False)),
+            pr_title=pr_title,
             error_code=str(values["error_code"]) if values.get("error_code") else None,
             error_message=str(values["error_message"]) if values.get("error_message") else None,
             node_history=list(values.get("node_history", [])),
@@ -773,7 +1377,7 @@ class VerticalSliceOrchestrator:
         cost_limit_usd: Decimal,
         actor: str,
     ) -> WorkflowExecutionSnapshot:
-        """Start a version-pinned vertical-slice workflow idempotently until pause or end."""
+        """Start a version-pinned SDLC workflow idempotently until pause or completion."""
         if cost_limit_usd <= Decimal("0"):
             raise ValidationFailedError(
                 "A positive cost_limit_usd is mandatory to start any workflow.",
@@ -809,6 +1413,16 @@ class VerticalSliceOrchestrator:
         self._db.add(run)
         self._db.flush()
 
+        config, tracing_enabled = build_langgraph_run_config(
+            thread_id=thread_id,
+            workflow_id=run.id,
+            repository_id=repository.id,
+            base_commit_sha=base_commit_sha,
+            settings=self._settings,
+            is_private_repo=repository.is_private,
+            llm_data_sharing=repository.llm_data_sharing,
+        )
+
         initial_state: WorkflowState = {
             "state_schema_version": WORKFLOW_STATE_SCHEMA_VERSION,
             "workflow_id": run.id,
@@ -817,6 +1431,7 @@ class VerticalSliceOrchestrator:
             "repository_full_name": repository.full_name,
             "is_private_repo": repository.is_private,
             "llm_data_sharing": repository.llm_data_sharing,
+            "tracing_enabled": tracing_enabled,
             "base_branch": base_branch,
             "base_commit_sha": base_commit_sha,
             "workspace_dir": str(workspace_dir.resolve()),
@@ -832,13 +1447,18 @@ class VerticalSliceOrchestrator:
             "cost_status": "estimated",
             "clarification_attempts": 0,
             "clarification_answers": None,
+            "test_correction_loops": 0,
+            "review_correction_loops": 0,
+            "total_correction_loops": 0,
+            "pending_correction_feedback": None,
             "plan_approved": False,
             "approved_protected_paths": [],
+            "touched_files": [],
+            "commit_approved": False,
             "usage_records": [],
             "node_history": [],
         }
 
-        config = {"configurable": {"thread_id": thread_id}}
         self._graph.invoke(initial_state, config=config)
         post_snapshot = self._graph.get_state(config)
         response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
@@ -853,6 +1473,7 @@ class VerticalSliceOrchestrator:
                 "base_commit_sha": base_commit_sha,
                 "status": response.status,
                 "cost_limit_usd": str(cost_limit_usd),
+                "tracing_enabled": tracing_enabled,
             },
         )
         return response
@@ -873,8 +1494,8 @@ class VerticalSliceOrchestrator:
                 details={"workflow_id": workflow_id},
             )
 
-        config = {"configurable": {"thread_id": run.thread_id}}
-        current_snapshot = self._graph.get_state(config)
+        lookup_config = {"configurable": {"thread_id": run.thread_id}}
+        current_snapshot = self._graph.get_state(lookup_config)
         values: dict[str, Any] = dict(getattr(current_snapshot, "values", {}) or {})
         if not values:
             raise ConflictError(
@@ -882,7 +1503,12 @@ class VerticalSliceOrchestrator:
                 details={"workflow_id": workflow_id},
             )
 
-        # Safety invariant: never resume an incompatible checkpoint state schema
+        if values.get("status") == "cancelled":
+            raise ConflictError(
+                "Cancelled workflow cannot be resumed.",
+                details={"workflow_id": workflow_id},
+            )
+
         validate_state_schema_version(values)
 
         pending_next = tuple(getattr(current_snapshot, "next", ()) or ())
@@ -892,11 +1518,21 @@ class VerticalSliceOrchestrator:
                 details={"workflow_id": workflow_id, "status": run.status},
             )
 
+        invoke_config, _ = build_langgraph_run_config(
+            thread_id=run.thread_id,
+            workflow_id=run.id,
+            repository_id=run.repository_id,
+            base_commit_sha=run.base_commit_sha,
+            settings=self._settings,
+            is_private_repo=bool(values.get("is_private_repo", True)),
+            llm_data_sharing=bool(values.get("llm_data_sharing", False)),
+        )
+
         self._graph.invoke(
             Command(resume=decision.model_dump(mode="json")),
-            config=config,
+            config=invoke_config,
         )
-        post_snapshot = self._graph.get_state(config)
+        post_snapshot = self._graph.get_state(lookup_config)
         response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
 
         self._audit.record(
@@ -907,8 +1543,65 @@ class VerticalSliceOrchestrator:
             details={
                 "base_commit_sha": run.base_commit_sha,
                 "approved_plan_hash": decision.approved_plan_hash,
+                "approved_patch_hash": decision.approved_patch_hash,
                 "resulting_status": response.status,
             },
+        )
+        return response
+
+    def cancel_workflow(
+        self,
+        *,
+        workflow_id: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> WorkflowExecutionSnapshot:
+        """Cancel an active or paused workflow cleanly in both checkpoint and projection."""
+        run = self._db.scalar(
+            select(WorkflowRunModel).where(WorkflowRunModel.id == workflow_id)
+        )
+        if run is None:
+            raise ResourceNotFoundError(
+                "Workflow run not found.",
+                details={"workflow_id": workflow_id},
+            )
+
+        config = {"configurable": {"thread_id": run.thread_id}}
+        current_snapshot = self._graph.get_state(config)
+        values: dict[str, Any] = dict(getattr(current_snapshot, "values", {}) or {})
+        if not values:
+            raise ConflictError(
+                "No LangGraph checkpoint found for workflow.",
+                details={"workflow_id": workflow_id},
+            )
+
+        current_status, _, _, _ = _derive_status_from_snapshot(current_snapshot)
+        if current_status in _TERMINAL_STATUSES:
+            raise ConflictError(
+                f"Workflow in terminal status '{current_status}' cannot be cancelled.",
+                details={"workflow_id": workflow_id, "status": current_status},
+            )
+
+        cancel_msg = reason or "Cancelled by operator."
+        self._graph.update_state(
+            config,
+            {
+                "status": "cancelled",
+                "cancelled_by": actor,
+                "cancel_reason": cancel_msg,
+                "error_code": "WORKFLOW_CANCELLED",
+                "error_message": cancel_msg,
+            },
+        )
+        post_snapshot = self._graph.get_state(config)
+        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
+
+        self._audit.record(
+            actor=actor,
+            action="workflow.cancel",
+            resource_type="workflow",
+            resource_id=run.id,
+            details={"reason": cancel_msg, "previous_status": current_status},
         )
         return response
 

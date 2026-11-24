@@ -1,4 +1,4 @@
-# Phase 4 Vertical-Slice LangGraph Orchestration
+# SDLC LangGraph Workflow Orchestration
 
 ## Deterministic StateGraph Topology
 
@@ -11,30 +11,38 @@ START
  -> planning (consolidated TechnicalDesign + ImplementationPlan + deterministic plan_hash)
  -> human_plan_approval (interrupt bound to plan_hash and base_commit_sha)
       -> rejected / hash mismatch: END
-      -> approved: coding (PatchService validation + atomic apply)
+      -> approved: coding (PatchService validation + atomic apply + cumulative diff/patch_hash)
  -> sandbox_test (two-phase install + offline pytest via sandbox-runner)
- -> END
+      -> failed: test_failure_analysis (TestingAgent) -> bounded correction -> coding
+      -> passed: code_review (CodeReviewAgent + deterministic quality/integrity gates)
+           -> failed: bounded correction -> coding
+           -> passed: human_commit_approval (interrupt showing raw diff, flags, tests, review, cost; bound to patch_hash and base_commit_sha)
+                -> rejected / hash mismatch: END
+                -> approved: release_preparation (ReleaseAgent drafts PR metadata & final report) -> END
 ```
 
 ## State Ownership and Persistence
 - Authoritative execution state: Owned exclusively by LangGraph checkpoints (PostgresSaver in runtime/Celery workers, MemorySaver in isolated unit tests).
 
-- Application projection: workflow_runs stores user-facing metadata (status, current_node, idempotency_key, cost_limit_usd, base_commit_sha) synced idempotently after each invocation. VerticalSliceOrchestrator.reconcile_projection(...) repairs projection drift from the checkpoint.
+- Application projection: workflow_runs stores user-facing metadata (status, current_node, idempotency_key, cost_limit_usd, base_commit_sha) synced idempotently after each transition. WorkflowOrchestrator.reconcile_projection(...) repairs projection drift from the checkpoint.
 
 - PostgreSQL checkpointer bootstrap: LangGraph manages its own checkpoint tables outside Alembic via bootstrap_postgres_checkpointer(settings.DATABASE_URL).
 
 - Schema compatibility: Every checkpoint carries state_schema_version. resume_workflow(...) refuses to resume any checkpoint with an incompatible schema version.
 
-## Safety Controls Enforced in Phase 4
+## Safety Controls and Bounded Execution
 1. Mandatory cost limit: Workflows refuse to start unless a positive cost_limit_usd is explicitly set.
 
 2. Idempotent start: Re-submitting the same idempotency_key returns the existing run snapshot without duplicating LLM calls or workspace mutations.
 
-3. Human approval binding: human_plan_approval validates both approved_plan_hash and approved_base_commit_sha; any drift or mismatch aborts before coding runs.
+3. Dual human approvals with hash binding:
 
-4. Isolated execution: Untrusted repository code and tests run only through SandboxClient (sandbox-runner) using the two-phase network policy (restricted_egress -> none).
+4. human_plan_approval validates (approved_plan_hash, approved_base_commit_sha).
 
-## Known Limitations
-- Testing failure-analysis correction loops, deterministic static-analysis quality gates, Code Review Agent, and Release/GitHub PR automation are introduced in Phases 5, 6, and 7.
+5. human_commit_approval presents the raw cumulative diff, flags, test results, review findings, and cost, validating (approved_patch_hash, approved_base_commit_sha).
 
-- FastAPI workflow endpoints (POST /api/v1/workflows, /approve, /reject, /resume, /cancel) and Celery job dispatch wiring are delivered in Phases 5 and 8.
+6. Impossible infinite loops: Separate per-failure (MAX_CORRECTION_LOOPS_PER_FAILURE) and total workflow (MAX_CORRECTION_LOOPS_PER_WORKFLOW) correction limits enforce clean termination with CORRECTION_LIMIT_EXCEEDED.
+
+7. Safe cancellation: cancel_workflow(...) transitions active or paused workflows to cancelled in both checkpoint and projection, preventing accidental resume.
+
+8. Privacy-aware tracing: LangSmith tracing is opt-in, disabled by default for private repositories without llm_data_sharing=True, and scrubs secrets from all trace metadata.
