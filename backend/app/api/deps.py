@@ -15,6 +15,7 @@ from app.integrations.github.client import GitHubClient
 from app.integrations.qdrant.client import QdrantIndexClient
 from app.schemas.auth import OperatorIdentity
 from app.services.workspace_service import WorkspaceService
+from app.workflows.tasks import CeleryWorkflowDispatcher, WorkflowJobDispatcher
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -58,9 +59,15 @@ def get_qdrant_client() -> QdrantIndexClient:
     return QdrantIndexClient()
 
 
+def get_workflow_dispatcher() -> WorkflowJobDispatcher:
+    """Provide the background workflow job dispatcher backed by Celery."""
+    return CeleryWorkflowDispatcher()
+
+
 CurrentOperator = Annotated[OperatorIdentity, Depends(get_current_operator)]
 DbSession = Annotated[Session, Depends(get_db)]
 GitHubClientDep = Annotated[GitHubClient, Depends(get_github_client)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 EmbeddingClientDep = Annotated[EmbeddingClient, Depends(get_embedding_client)]
 QdrantClientDep = Annotated[QdrantIndexClient, Depends(get_qdrant_client)]
+WorkflowDispatcherDep = Annotated[WorkflowJobDispatcher, Depends(get_workflow_dispatcher)]

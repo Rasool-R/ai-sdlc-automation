@@ -12,7 +12,7 @@ def create_celery_app() -> Celery:
         settings.APP_NAME,
         broker=settings.CELERY_BROKER_URL,
         backend=settings.CELERY_RESULT_BACKEND,
-        include=["app.workflows.jobs"],
+        include=["app.workflows.jobs", "app.workflows.tasks"],
     )
     app.conf.update(
         task_serializer="json",
