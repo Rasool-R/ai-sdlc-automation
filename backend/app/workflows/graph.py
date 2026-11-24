@@ -2,7 +2,7 @@
 
 Architecture invariants:
 - LangGraph checkpoints are the single source of truth for execution state.
-- WorkflowRunModel is an application-level projection synced idempotently at transitions.
+- WorkflowRunModel and governance tables are projections synced idempotently at transitions.
 - Routing is strictly deterministic Python (no LLM-based Supervisor).
 - Human approvals bind explicitly to (plan_hash, base_commit_sha) and (patch_hash, base_commit_sha).
 - Bounded correction loops guarantee infinite retries are impossible.
@@ -60,6 +60,7 @@ from app.models.repository import RepositoryModel
 from app.models.workflow import WorkflowRunModel
 from app.observability.tracing import build_langgraph_run_config
 from app.services.audit_service import AuditService
+from app.workflows.governance import WorkflowGovernanceRecorder
 from app.workflows.state import (
     WORKFLOW_STATE_SCHEMA_VERSION,
     HumanDecision,
@@ -1274,6 +1275,7 @@ class WorkflowOrchestrator:
         self._db = db
         self._settings = settings or get_settings()
         self._audit = AuditService(db)
+        self._governance = WorkflowGovernanceRecorder(db)
         self._graph = build_sdlc_workflow_graph(
             db=db,
             llm_client=llm_client,
@@ -1283,6 +1285,50 @@ class WorkflowOrchestrator:
             checkpointer=checkpointer,
             settings=self._settings,
         )
+
+    def _build_initial_state(
+        self,
+        *,
+        run: WorkflowRunModel,
+        repository: RepositoryModel,
+        workspace_dir: Path,
+        tracing_enabled: bool,
+    ) -> WorkflowState:
+        return {
+            "state_schema_version": WORKFLOW_STATE_SCHEMA_VERSION,
+            "workflow_id": run.id,
+            "thread_id": run.thread_id,
+            "repository_id": repository.id,
+            "repository_full_name": repository.full_name,
+            "is_private_repo": repository.is_private,
+            "llm_data_sharing": repository.llm_data_sharing,
+            "tracing_enabled": tracing_enabled,
+            "base_branch": run.base_branch,
+            "base_commit_sha": run.base_commit_sha,
+            "workspace_dir": str(workspace_dir.resolve()),
+            "title": run.title,
+            "request_text": run.request_text,
+            "cost_limit_usd": str(run.cost_limit_usd),
+            "status": "running",
+            "current_node": "requirement_analysis",
+            "started_at_iso": datetime.now(UTC).isoformat(),
+            "llm_calls_count": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": "0.000000",
+            "cost_status": "estimated",
+            "clarification_attempts": 0,
+            "clarification_answers": None,
+            "test_correction_loops": 0,
+            "review_correction_loops": 0,
+            "total_correction_loops": 0,
+            "pending_correction_feedback": None,
+            "plan_approved": False,
+            "approved_protected_paths": [],
+            "touched_files": [],
+            "commit_approved": False,
+            "usage_records": [],
+            "node_history": [],
+        }
 
     def _build_snapshot_response(
         self,
@@ -1351,17 +1397,21 @@ class WorkflowOrchestrator:
         *,
         run: WorkflowRunModel,
         checkpoint_snapshot: Any,
+        reused_existing: bool = False,
     ) -> WorkflowExecutionSnapshot:
+        values: dict[str, Any] = dict(getattr(checkpoint_snapshot, "values", {}) or {})
         status, current_node, _interrupted, _payload = _derive_status_from_snapshot(
             checkpoint_snapshot
         )
         run.status = status
         run.current_node = current_node
+        if values:
+            self._governance.sync_from_state(workflow_id=run.id, state=values)
         self._db.flush()
         return self._build_snapshot_response(
             run=run,
             checkpoint_snapshot=checkpoint_snapshot,
-            reused_existing=False,
+            reused_existing=reused_existing,
         )
 
     def start_workflow(
@@ -1423,42 +1473,12 @@ class WorkflowOrchestrator:
             llm_data_sharing=repository.llm_data_sharing,
         )
 
-        initial_state: WorkflowState = {
-            "state_schema_version": WORKFLOW_STATE_SCHEMA_VERSION,
-            "workflow_id": run.id,
-            "thread_id": thread_id,
-            "repository_id": repository.id,
-            "repository_full_name": repository.full_name,
-            "is_private_repo": repository.is_private,
-            "llm_data_sharing": repository.llm_data_sharing,
-            "tracing_enabled": tracing_enabled,
-            "base_branch": base_branch,
-            "base_commit_sha": base_commit_sha,
-            "workspace_dir": str(workspace_dir.resolve()),
-            "title": title,
-            "request_text": request_text,
-            "cost_limit_usd": str(cost_limit_usd),
-            "status": "running",
-            "current_node": "requirement_analysis",
-            "started_at_iso": datetime.now(UTC).isoformat(),
-            "llm_calls_count": 0,
-            "total_tokens": 0,
-            "estimated_cost_usd": "0.000000",
-            "cost_status": "estimated",
-            "clarification_attempts": 0,
-            "clarification_answers": None,
-            "test_correction_loops": 0,
-            "review_correction_loops": 0,
-            "total_correction_loops": 0,
-            "pending_correction_feedback": None,
-            "plan_approved": False,
-            "approved_protected_paths": [],
-            "touched_files": [],
-            "commit_approved": False,
-            "usage_records": [],
-            "node_history": [],
-        }
-
+        initial_state = self._build_initial_state(
+            run=run,
+            repository=repository,
+            workspace_dir=workspace_dir,
+            tracing_enabled=tracing_enabled,
+        )
         self._graph.invoke(initial_state, config=config)
         post_snapshot = self._graph.get_state(config)
         response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
@@ -1473,6 +1493,86 @@ class WorkflowOrchestrator:
                 "base_commit_sha": base_commit_sha,
                 "status": response.status,
                 "cost_limit_usd": str(cost_limit_usd),
+                "tracing_enabled": tracing_enabled,
+            },
+        )
+        return response
+
+    def execute_queued_workflow(
+        self,
+        *,
+        workflow_id: str,
+        workspace_dir: Path,
+    ) -> WorkflowExecutionSnapshot:
+        """Execute a pre-created queued workflow idempotently inside a background worker."""
+        run = self._db.scalar(
+            select(WorkflowRunModel).where(WorkflowRunModel.id == workflow_id)
+        )
+        if run is None:
+            raise ResourceNotFoundError(
+                "Workflow run not found.",
+                details={"workflow_id": workflow_id},
+            )
+
+        if run.status == "cancelled":
+            return WorkflowExecutionSnapshot(
+                workflow_id=run.id,
+                thread_id=run.thread_id,
+                state_schema_version=WORKFLOW_STATE_SCHEMA_VERSION,
+                status="cancelled",
+                current_node=run.current_node,
+                base_commit_sha=run.base_commit_sha,
+                reused_existing=True,
+            )
+
+        lookup_config = {"configurable": {"thread_id": run.thread_id}}
+        existing_snapshot = self._graph.get_state(lookup_config)
+        existing_values: dict[str, Any] = dict(getattr(existing_snapshot, "values", {}) or {})
+        if existing_values:
+            # Duplicate queue delivery: checkpoint already exists, reconcile and return safely
+            return self._sync_projection(
+                run=run,
+                checkpoint_snapshot=existing_snapshot,
+                reused_existing=True,
+            )
+
+        repository = self._db.scalar(
+            select(RepositoryModel).where(RepositoryModel.id == run.repository_id)
+        )
+        if repository is None:
+            raise ResourceNotFoundError(
+                "Repository linked to workflow not found.",
+                details={"repository_id": run.repository_id, "workflow_id": run.id},
+            )
+
+        invoke_config, tracing_enabled = build_langgraph_run_config(
+            thread_id=run.thread_id,
+            workflow_id=run.id,
+            repository_id=repository.id,
+            base_commit_sha=run.base_commit_sha,
+            settings=self._settings,
+            is_private_repo=repository.is_private,
+            llm_data_sharing=repository.llm_data_sharing,
+        )
+        initial_state = self._build_initial_state(
+            run=run,
+            repository=repository,
+            workspace_dir=workspace_dir,
+            tracing_enabled=tracing_enabled,
+        )
+        self._graph.invoke(initial_state, config=invoke_config)
+        post_snapshot = self._graph.get_state(lookup_config)
+        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
+
+        self._audit.record(
+            actor=run.created_by,
+            action="workflow.worker_start",
+            resource_type="workflow",
+            resource_id=run.id,
+            details={
+                "repository_id": repository.id,
+                "base_commit_sha": run.base_commit_sha,
+                "status": response.status,
                 "tracing_enabled": tracing_enabled,
             },
         )
@@ -1570,9 +1670,27 @@ class WorkflowOrchestrator:
         current_snapshot = self._graph.get_state(config)
         values: dict[str, Any] = dict(getattr(current_snapshot, "values", {}) or {})
         if not values:
-            raise ConflictError(
-                "No LangGraph checkpoint found for workflow.",
-                details={"workflow_id": workflow_id},
+            if run.status in _TERMINAL_STATUSES:
+                raise ConflictError(
+                    f"Workflow in terminal status '{run.status}' cannot be cancelled.",
+                    details={"workflow_id": workflow_id, "status": run.status},
+                )
+            run.status = "cancelled"
+            self._db.flush()
+            self._audit.record(
+                actor=actor,
+                action="workflow.cancel",
+                resource_type="workflow",
+                resource_id=run.id,
+                details={"reason": reason or "Cancelled before worker start."},
+            )
+            return WorkflowExecutionSnapshot(
+                workflow_id=run.id,
+                thread_id=run.thread_id,
+                state_schema_version=WORKFLOW_STATE_SCHEMA_VERSION,
+                status="cancelled",
+                current_node=run.current_node,
+                base_commit_sha=run.base_commit_sha,
             )
 
         current_status, _, _, _ = _derive_status_from_snapshot(current_snapshot)

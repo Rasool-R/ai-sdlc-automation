@@ -278,8 +278,13 @@ class LLMClient:
 
             return content, prompt_tokens, completion_tokens, total_tokens, retries_used
 
-        assert last_error is not None
-        raise last_error
+        if last_error is not None:
+            raise last_error
+        raise AppError(
+            "LLM request failed without a response.",
+            code="LLM_UNKNOWN_ERROR",
+            status_code=502,
+        )
 
     def complete_structured(
         self,
