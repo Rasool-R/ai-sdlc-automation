@@ -2,6 +2,12 @@
 
 from app.db.base import Base
 from app.models.audit import AuditLogModel
+from app.models.execution import (
+    CodeChangeModel,
+    CodeReviewModel,
+    StaticAnalysisFindingModel,
+    TestExecutionModel,
+)
 from app.models.governance import (
     AgentExecutionModel,
     ApprovalModel,
@@ -28,7 +34,9 @@ __all__ = [
     "ApprovalModel",
     "AuditLogModel",
     "Base",
+    "CodeChangeModel",
     "CodeRelationshipModel",
+    "CodeReviewModel",
     "CodeSymbolModel",
     "LLMUsageRecordModel",
     "ProjectModel",
@@ -36,8 +44,10 @@ __all__ = [
     "RepositoryLockModel",
     "RepositoryModel",
     "RepositoryVersionModel",
+    "StaticAnalysisFindingModel",
     "TaskDependencyModel",
     "TaskModel",
+    "TestExecutionModel",
     "UserModel",
     "WorkflowRunModel",
 ]

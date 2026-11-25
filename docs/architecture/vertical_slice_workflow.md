@@ -22,27 +22,28 @@ START
 ```
 
 ## State Ownership and Persistence
-- Authoritative execution state: Owned exclusively by LangGraph checkpoints (PostgresSaver in runtime/Celery workers, MemorySaver in isolated unit tests).
+- Authoritative execution state: Owned exclusively by LangGraph checkpoints (`PostgresSaver` in runtime/Celery workers, `MemorySaver` in isolated unit tests).
 
-- Application projection: workflow_runs stores user-facing metadata (status, current_node, idempotency_key, cost_limit_usd, base_commit_sha) synced idempotently after each transition. WorkflowOrchestrator.reconcile_projection(...) repairs projection drift from the checkpoint.
+- Application and evidence projections: `workflow_runs`, `agent_executions`, `tasks`, `task_dependencies`, `approvals`, `llm_usage_records`, `code_changes`, `test_executions`, `static_analysis_findings`, and `code_reviews` are synced idempotently after each transition. `WorkflowOrchestrator.reconcile_projection(...)` repairs projection drift from the checkpoint
 
-- PostgreSQL checkpointer bootstrap: LangGraph manages its own checkpoint tables outside Alembic via bootstrap_postgres_checkpointer(settings.DATABASE_URL).
+- PostgreSQL checkpointer bootstrap: LangGraph manages its own checkpoint tables outside Alembic via `bootstrap_postgres_checkpointer(settings.DATABASE_URL)`.
 
-- Schema compatibility: Every checkpoint carries state_schema_version. resume_workflow(...) refuses to resume any checkpoint with an incompatible schema version.
+- Schema compatibility: Every checkpoint carries `state_schema_version`. `resume_workflow(...)` refuses to resume any checkpoint with an incompatible schema version.
 
 ## Safety Controls and Bounded Execution
-1. Mandatory cost limit: Workflows refuse to start unless a positive cost_limit_usd is explicitly set.
+1. Mandatory cost limit: Workflows refuse to start unless a positive `cost_limit_usd` is explicitly set.
 
-2. Idempotent start: Re-submitting the same idempotency_key returns the existing run snapshot without duplicating LLM calls or workspace mutations.
+2. Idempotent start: Re-submitting the same `idempotency_key` returns the existing run snapshot without duplicating LLM calls or workspace mutations.
 
 3. Dual human approvals with hash binding:
+     - `human_plan_approval` validates `(approved_plan_hash, approved_base_commit_sha)`.
 
-4. human_plan_approval validates (approved_plan_hash, approved_base_commit_sha).
+     - `human_commit_approval` presents the raw cumulative diff, flags, test results, static-analysis report, review findings, and cost, validating `(approved_patch_hash, approved_base_commit_sha)`.
 
-5. human_commit_approval presents the raw cumulative diff, flags, test results, review findings, and cost, validating (approved_patch_hash, approved_base_commit_sha).
+4. Non-overridable quality gates: Blocking deterministic findings from Ruff, Mypy, Bandit, pip-audit, or test-integrity checks force `CodeReviewReport.passed = False` regardless of LLM output and route back into bounded correction.
 
-6. Impossible infinite loops: Separate per-failure (MAX_CORRECTION_LOOPS_PER_FAILURE) and total workflow (MAX_CORRECTION_LOOPS_PER_WORKFLOW) correction limits enforce clean termination with CORRECTION_LIMIT_EXCEEDED.
+5. Impossible infinite loops: Separate per-failure (`MAX_CORRECTION_LOOPS_PER_FAILURE`) and total workflow (`MAX_CORRECTION_LOOPS_PER_WORKFLOW`) correction limits enforce clean termination with `CORRECTION_LIMIT_EXCEEDED`.
 
-7. Safe cancellation: cancel_workflow(...) transitions active or paused workflows to cancelled in both checkpoint and projection, preventing accidental resume.
+6. Safe cancellation: `cancel_workflow(...)` transitions active or paused workflows to `cancelled` in both checkpoint and projection, preventing accidental resume.
 
-8. Privacy-aware tracing: LangSmith tracing is opt-in, disabled by default for private repositories without llm_data_sharing=True, and scrubs secrets from all trace metadata.
+7. Privacy-aware tracing: LangSmith tracing is opt-in, disabled by default for private repositories without `llm_data_sharing=True`, and scrubs secrets from all trace metadata.

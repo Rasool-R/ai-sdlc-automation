@@ -105,9 +105,15 @@ class WorkflowState(TypedDict, total=False):
     patch_apply_result: dict[str, Any] | None
     patch_hash: str | None
     sandbox_report: dict[str, Any] | None
+    static_analysis_report: dict[str, Any] | None
     static_analysis_summary: str | None
     last_test_diagnosis: dict[str, Any] | None
     code_review_report: dict[str, Any] | None
+
+    code_change_history: list[dict[str, Any]]
+    test_execution_history: list[dict[str, Any]]
+    static_analysis_history: list[dict[str, Any]]
+    code_review_history: list[dict[str, Any]]
 
     commit_approved: bool
     commit_approval_record: dict[str, Any] | None
@@ -144,6 +150,8 @@ class WorkflowExecutionSnapshot(BaseModel):
     review_correction_loops: int = Field(default=0, ge=0)
     total_correction_loops: int = Field(default=0, ge=0)
     sandbox_passed: bool | None = None
+    static_analysis_passed: bool | None = None
+    static_analysis_blocking_count: int = Field(default=0, ge=0)
     review_passed: bool | None = None
     commit_approved: bool = False
     pr_title: str | None = None

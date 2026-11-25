@@ -28,6 +28,7 @@ from app.core.exceptions import ConflictError, ValidationFailedError
 from app.execution.patch_service import PatchService
 from app.execution.sandbox_client import SandboxClient
 from app.execution.schemas import FilePatchOperation, PatchBundle, SearchReplaceHunk
+from app.execution.static_analysis import PipAuditRawOutcome, StaticAnalysisService
 from app.integrations.embeddings.client import EmbeddingClient
 from app.integrations.llm.client import LLMClient
 from app.integrations.qdrant.client import QdrantIndexClient
@@ -47,6 +48,19 @@ from sqlalchemy.pool import StaticPool
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_FIXTURE_DIR = REPO_ROOT / "fixtures" / "demo_fastapi_repo"
+
+
+class _CleanPipAuditStub:
+    def audit_requirements_file(self, requirements_path: Path) -> PipAuditRawOutcome:
+        _ = requirements_path
+        return PipAuditRawOutcome(
+            available=True,
+            exit_code=0,
+            stdout=json.dumps({"dependencies": []}),
+            stderr="",
+            duration_seconds=0.05,
+            tool_version="pip-audit 2.7.3",
+        )
 
 
 def _init_demo_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -409,6 +423,25 @@ def _make_sandbox_mock_handler(
                         "timed_out": False,
                     },
                 )
+            if template in {"ruff_check", "mypy_check", "bandit_check"}:
+                stdout = "[]" if template == "ruff_check" else ""
+                if template == "bandit_check":
+                    stdout = json.dumps({"results": []})
+                return httpx.Response(
+                    200,
+                    json={
+                        "execution_id": f"exec-{template}",
+                        "template": template,
+                        "phase": "isolated_execution",
+                        "network_policy": "none",
+                        "command_argv": [template],
+                        "exit_code": 0,
+                        "stdout": stdout,
+                        "stderr": "",
+                        "duration_seconds": 0.1,
+                        "timed_out": False,
+                    },
+                )
             code = exit_queue.pop(0) if len(exit_queue) > 1 else exit_queue[0]
             return httpx.Response(
                 200,
@@ -439,6 +472,7 @@ def _make_orchestrator(
     llm_http: httpx.Client,
     sbx_http: httpx.Client,
 ) -> WorkflowOrchestrator:
+    sbx_client = SandboxClient(settings=settings, http_client=sbx_http)
     return WorkflowOrchestrator(
         db,
         llm_client=LLMClient(settings=settings, http_client=llm_http),
@@ -449,7 +483,11 @@ def _make_orchestrator(
             qdrant_client=QdrantIndexClient(settings=settings),
         ),
         patch_service=PatchService(settings=settings),
-        sandbox_client=SandboxClient(settings=settings, http_client=sbx_http),
+        sandbox_client=sbx_client,
+        static_analysis_service=StaticAnalysisService(
+            sandbox_client=sbx_client,
+            pip_audit_runner=_CleanPipAuditStub(),
+        ),
         checkpointer=create_memory_checkpointer(),
         settings=settings,
     )
@@ -466,7 +504,6 @@ def test_normalize_postgres_conninfo_and_langsmith_privacy_policy() -> None:
         LANGSMITH_TRACING=True,
         LANGSMITH_API_KEY="lsv2_test_key_1234567890abcdef",  # noqa: S106
     )
-    # Private repo without explicit opt-in disables tracing
     assert (
         should_enable_langsmith_tracing(
             settings=traced_settings,
@@ -475,7 +512,6 @@ def test_normalize_postgres_conninfo_and_langsmith_privacy_policy() -> None:
         )
         is False
     )
-    # Private repo with opt-in enables tracing
     assert (
         should_enable_langsmith_tracing(
             settings=traced_settings,
@@ -519,10 +555,8 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         elif call_idx == 3:
             content = _make_planning_json()
         elif call_idx == 4:
-            # First coding attempt uses default_limit=20, triggering a sandbox test failure
             content = _make_initial_coding_json(workspace, commit_sha, default_limit=20)
         elif call_idx == 5:
-            # TestingAgent diagnoses the default limit failure
             content = TestFailureDiagnosis(
                 summary="Default limit=20 broke baseline test expecting 25 items.",
                 failure_category="assertion_failure",
@@ -534,7 +568,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
                 is_fixable_by_coding_agent=True,
             ).model_dump_json()
         elif call_idx == 6:
-            # Second coding attempt patches current workspace file from default=20 to default=25
             current_main_hash = compute_sha256_bytes((workspace / "app/main.py").read_bytes())
             content = CodingOutput(
                 rationale="Fixed default limit from 20 to 25 per test failure diagnosis.",
@@ -579,7 +612,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
     ):
         orchestrator = _make_orchestrator(db_session, settings, mock_llm_http, mock_sbx_http)
 
-        # 1. Start -> pauses at human plan approval
         plan_pause = orchestrator.start_workflow(
             repository=repo,
             base_branch="main",
@@ -596,7 +628,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         assert plan_pause.plan_hash is not None
         assert compute_sha256_bytes((workspace / "app/main.py").read_bytes()) == original_main_hash
 
-        # Idempotent re-submission does not duplicate calls
         dup = orchestrator.start_workflow(
             repository=repo,
             base_branch="main",
@@ -611,8 +642,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         assert dup.reused_existing is True
         assert call_idx == 3
 
-        # 2. Approve plan -> coding -> sandbox fail -> testing diagnosis -> coding fix ->
-        #    sandbox pass -> code review pass -> pauses at human Commit/PR approval
         commit_pause = orchestrator.resume_workflow(
             workflow_id=plan_pause.workflow_id,
             decision=HumanDecision(
@@ -627,11 +656,12 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         assert commit_pause.test_correction_loops == 1
         assert commit_pause.total_correction_loops == 1
         assert commit_pause.sandbox_passed is True
+        assert commit_pause.static_analysis_passed is True
         assert commit_pause.review_passed is True
         assert commit_pause.patch_hash is not None
         assert commit_pause.interrupt_payload is not None
         assert commit_pause.interrupt_payload["type"] == "commit_approval_required"
-        # Raw cumulative diff includes all 3 files relative to base_commit_sha
+        assert commit_pause.interrupt_payload["static_analysis_report"]["passed"] is True
         assert set(commit_pause.interrupt_payload["files_changed"]) == {
             "README.md",
             "app/main.py",
@@ -640,7 +670,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         assert "default=25" in commit_pause.interrupt_payload["raw_diff"]
         assert "default=20" not in commit_pause.interrupt_payload["raw_diff"]
 
-        # Simulate projection drift and confirm reconciliation repairs it
         run_row = db_session.scalar(
             select(WorkflowRunModel).where(WorkflowRunModel.id == plan_pause.workflow_id)
         )
@@ -650,7 +679,6 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         reconciled = orchestrator.reconcile_projection(plan_pause.workflow_id)
         assert reconciled.status == "waiting_commit_approval"
 
-        # 3. Approve Commit/PR bound to exact patch_hash and base_commit_sha -> ReleaseAgent runs
         completed = orchestrator.resume_workflow(
             workflow_id=plan_pause.workflow_id,
             decision=HumanDecision(
@@ -675,6 +703,7 @@ def test_full_seven_agent_workflow_with_test_correction_loop_and_dual_approvals(
         "test_failure_analysis",
         "coding",
         "sandbox_test",
+        "static_analysis",
         "code_review",
         "human_commit_approval",
         "release_preparation",
@@ -709,7 +738,6 @@ def test_review_correction_loop_and_correction_cap_prevent_infinite_loops(
         elif call_idx == 4:
             content = _make_initial_coding_json(workspace, commit_sha, default_limit=20)
         elif call_idx == 5:
-            # First review fails -> routes back to coding (review_correction_loops=1)
             content = _make_failing_review_json()
         elif call_idx == 6:
             current_main_hash = compute_sha256_bytes((workspace / "app/main.py").read_bytes())
@@ -734,7 +762,6 @@ def test_review_correction_loop_and_correction_cap_prevent_infinite_loops(
                 ),
             ).model_dump_json()
         else:
-            # Second review still fails -> hits MAX_CORRECTION_LOOPS_PER_FAILURE=1 and halts safely
             content = _make_failing_review_json()
 
         return httpx.Response(
@@ -805,7 +832,6 @@ def test_commit_approval_mismatch_cancellation_and_clarification_flow(
     ):
         orchestrator = _make_orchestrator(db_session, settings, mock_llm_http, mock_sbx_http)
 
-        # Clarification interrupt -> resume with operator answer -> plan approval
         clarify_pause = orchestrator.start_workflow(
             repository=repo,
             base_branch="main",
@@ -841,7 +867,6 @@ def test_commit_approval_mismatch_cancellation_and_clarification_flow(
         )
         assert commit_pause.status == "waiting_commit_approval"
 
-        # Incompatible checkpoint schema version cannot be resumed
         cfg = {"configurable": {"thread_id": commit_pause.thread_id}}
         orchestrator._graph.update_state(cfg, {"state_schema_version": "0.9-old"})
         with pytest.raises(ValidationFailedError):
@@ -856,7 +881,6 @@ def test_commit_approval_mismatch_cancellation_and_clarification_flow(
             )
         orchestrator._graph.update_state(cfg, {"state_schema_version": "1.0"})
 
-        # Mismatched patch_hash fails safely before release_preparation
         mismatch = orchestrator.resume_workflow(
             workflow_id=commit_pause.workflow_id,
             decision=HumanDecision(
@@ -870,7 +894,6 @@ def test_commit_approval_mismatch_cancellation_and_clarification_flow(
         assert mismatch.error_code == "APPROVAL_BINDING_MISMATCH"
         assert "release_preparation" not in mismatch.node_history
 
-        # Verify cancellation on a second paused workflow blocks future resume
         staged_cancel = iter([_make_req_json(needs_clarification=True)])
         orchestrator_cancel = _make_orchestrator(
             db_session,

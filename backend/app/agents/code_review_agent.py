@@ -9,6 +9,7 @@ from app.agents.schemas import (
 )
 from app.execution.sandbox_client import SandboxRunReport
 from app.execution.schemas import PatchValidationResult
+from app.execution.static_analysis import StaticAnalysisReport
 from app.integrations.llm.client import LLMClient, LLMUsageMetrics
 from app.prompts import load_prompt, wrap_untrusted_data
 
@@ -37,6 +38,7 @@ class CodeReviewAgent:
         report: CodeReviewReport,
         patch_validation: PatchValidationResult,
         sandbox_report: SandboxRunReport | None,
+        static_analysis_report: StaticAnalysisReport | None,
     ) -> CodeReviewReport:
         """Enforce non-overridable blocking rules independently of LLM judgment."""
         blocking_reasons = list(report.blocking_reasons)
@@ -78,6 +80,15 @@ class CodeReviewAgent:
             if reason not in blocking_reasons:
                 blocking_reasons.append(reason)
 
+        if static_analysis_report is not None and not static_analysis_report.passed:
+            passed = False
+            reason = (
+                "Deterministic static analysis gate failed "
+                f"({static_analysis_report.blocking_findings_count} blocking finding(s))."
+            )
+            if reason not in blocking_reasons:
+                blocking_reasons.append(reason)
+
         return report.model_copy(
             update={
                 "passed": passed,
@@ -94,6 +105,7 @@ class CodeReviewAgent:
         is_private_repo: bool,
         llm_data_sharing: bool,
         sandbox_report: SandboxRunReport | None = None,
+        static_analysis_report: StaticAnalysisReport | None = None,
         static_analysis_summary: str | None = None,
     ) -> CodeReviewAgentResult:
         """Execute structured code review and enforce deterministic quality/safety gates."""
@@ -114,6 +126,9 @@ class CodeReviewAgent:
             if sandbox_report is not None
             else "No sandbox test report provided."
         )
+        effective_static_summary = static_analysis_summary
+        if not effective_static_summary and static_analysis_report is not None:
+            effective_static_summary = static_analysis_report.summary_text
 
         sections = [
             f"Base Commit SHA: {patch_validation.base_commit_sha}",
@@ -138,12 +153,12 @@ class CodeReviewAgent:
             "Sandbox Test Execution Summary:",
             wrap_untrusted_data("sandbox_report", sandbox_summary[:MAX_STATIC_ANALYSIS_CHARS]),
         ]
-        if static_analysis_summary:
+        if effective_static_summary:
             sections.append(
                 "Static Analysis Findings (Ruff / Mypy / Bandit / pip-audit):\n"
                 + wrap_untrusted_data(
                     "static_analysis_findings",
-                    static_analysis_summary[:MAX_STATIC_ANALYSIS_CHARS],
+                    effective_static_summary[:MAX_STATIC_ANALYSIS_CHARS],
                 )
             )
 
@@ -160,5 +175,6 @@ class CodeReviewAgent:
             report=response.parsed,
             patch_validation=patch_validation,
             sandbox_report=sandbox_report,
+            static_analysis_report=static_analysis_report,
         )
         return CodeReviewAgentResult(report=gated_report, usage=response.usage)

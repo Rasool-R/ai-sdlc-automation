@@ -8,6 +8,7 @@ Architecture invariants:
 - Bounded correction loops guarantee infinite retries are impossible.
 """
 
+import contextlib
 import difflib
 import hashlib
 import logging
@@ -53,6 +54,7 @@ from app.execution.schemas import (
     ProtectedPathFlag,
     TestIntegrityFlag,
 )
+from app.execution.static_analysis import StaticAnalysisReport, StaticAnalysisService
 from app.execution.test_integrity import inspect_test_integrity
 from app.integrations.llm.client import LLMClient, LLMUsageMetrics
 from app.intelligence.retrieval import HybridRetrievalService
@@ -128,7 +130,7 @@ def _check_budget_limits(state: WorkflowState, settings: Settings) -> tuple[str,
 
     started_iso = state.get("started_at_iso")
     if started_iso:
-        try:
+        with contextlib.suppress(ValueError):
             started_dt = datetime.fromisoformat(started_iso)
             elapsed = (datetime.now(UTC) - started_dt).total_seconds()
             if elapsed > settings.WORKFLOW_TIMEOUT_SECONDS:
@@ -136,8 +138,6 @@ def _check_budget_limits(state: WorkflowState, settings: Settings) -> tuple[str,
                     "WORKFLOW_TIMEOUT",
                     f"Workflow exceeded wall-clock limit of {settings.WORKFLOW_TIMEOUT_SECONDS}s.",
                 )
-        except ValueError:
-            pass
 
     return None
 
@@ -307,7 +307,10 @@ def _compute_cumulative_validation(
     )
 
 
-def _format_review_correction_feedback(report: CodeReviewReport) -> str:
+def _format_review_correction_feedback(
+    report: CodeReviewReport,
+    static_report: StaticAnalysisReport | None = None,
+) -> str:
     lines: list[str] = [
         "Code Review failed. Address ALL blocking defects and re-verify:",
         f"Review Summary: {report.summary}",
@@ -321,6 +324,21 @@ def _format_review_correction_feedback(report: CodeReviewReport) -> str:
                 f"- [{finding.severity}/{finding.classification}] {finding.file_path}: "
                 f"{finding.title} -> {finding.recommendation}"
             )
+    if static_report is not None and static_report.findings:
+        blocking_static = [
+            f
+            for f in static_report.findings
+            if f.severity in {"Critical", "High"}
+            or (f.tool == "mypy" and f.severity == "Medium")
+        ]
+        if blocking_static:
+            lines.append("Blocking Deterministic Static Analysis Findings:")
+            for sf in blocking_static[:20]:
+                loc = f":{sf.start_line}" if sf.start_line is not None else ""
+                lines.append(
+                    f"- [{sf.tool}][{sf.severity}][{sf.rule_id}] "
+                    f"{sf.file_path}{loc}: {sf.message}"
+                )
     return "\n".join(lines)
 
 
@@ -374,10 +392,14 @@ def build_sdlc_workflow_graph(
     patch_service: PatchService,
     sandbox_client: SandboxClient,
     checkpointer: Any,
+    static_analysis_service: StaticAnalysisService | None = None,
     settings: Settings | None = None,
 ) -> Any:
     """Compile the deterministic seven-agent SDLC LangGraph StateGraph."""
     resolved_settings = settings or get_settings()
+    resolved_static = static_analysis_service or StaticAnalysisService(
+        sandbox_client=sandbox_client
+    )
     req_agent = RequirementAnalysisAgent(llm_client)
     repo_agent = RepositoryAnalysisAgent(llm_client, retrieval_service)
     plan_agent = PlanningAgent(llm_client)
@@ -800,6 +822,9 @@ def build_sdlc_workflow_graph(
                 "node_history": _append_history(state, "coding"),
             }
 
+        cumulative_dump = cumulative_validation.model_dump(mode="json")
+        change_history = [*state.get("code_change_history", []), cumulative_dump]
+
         if not cumulative_validation.valid:
             return {
                 **usage_update,
@@ -807,9 +832,10 @@ def build_sdlc_workflow_graph(
                 "current_node": "coding",
                 "touched_files": merged_touched,
                 "coding_output": coding_res.output.model_dump(mode="json"),
-                "patch_validation": cumulative_validation.model_dump(mode="json"),
+                "patch_validation": cumulative_dump,
                 "patch_apply_result": applied.model_dump(mode="json"),
                 "patch_hash": cumulative_validation.patch_hash,
+                "code_change_history": change_history,
                 "error_code": "PATCH_VALIDATION_FAILED",
                 "error_message": "; ".join(cumulative_validation.errors),
                 "node_history": _append_history(state, "coding"),
@@ -823,9 +849,10 @@ def build_sdlc_workflow_graph(
             "commit_approved": False,
             "touched_files": merged_touched,
             "coding_output": coding_res.output.model_dump(mode="json"),
-            "patch_validation": cumulative_validation.model_dump(mode="json"),
+            "patch_validation": cumulative_dump,
             "patch_apply_result": applied.model_dump(mode="json"),
             "patch_hash": cumulative_validation.patch_hash,
+            "code_change_history": change_history,
             "node_history": _append_history(state, "coding"),
         }
 
@@ -846,10 +873,12 @@ def build_sdlc_workflow_graph(
                 "node_history": _append_history(state, "sandbox_test"),
             }
 
+        report_dump = report.model_dump(mode="json")
         return {
             "status": "running",
             "current_node": "sandbox_test",
-            "sandbox_report": report.model_dump(mode="json"),
+            "sandbox_report": report_dump,
+            "test_execution_history": [*state.get("test_execution_history", []), report_dump],
             "node_history": _append_history(state, "sandbox_test"),
         }
 
@@ -858,8 +887,35 @@ def build_sdlc_workflow_graph(
             return "end"
         sandbox_raw = state.get("sandbox_report")
         if isinstance(sandbox_raw, dict) and bool(sandbox_raw.get("passed")):
-            return "code_review"
+            return "static_analysis"
         return "test_failure_analysis"
+
+    def static_analysis_node(state: WorkflowState) -> dict[str, Any]:
+        try:
+            report = resolved_static.run(
+                workflow_id=state["workflow_id"],
+                repository_id=state["repository_id"],
+                base_commit_sha=state["base_commit_sha"],
+                workspace_dir=Path(state["workspace_dir"]),
+            )
+        except AppError as exc:
+            return {
+                "status": "failed",
+                "current_node": "static_analysis",
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "node_history": _append_history(state, "static_analysis"),
+            }
+
+        report_dump = report.model_dump(mode="json")
+        return {
+            "status": "running",
+            "current_node": "static_analysis",
+            "static_analysis_report": report_dump,
+            "static_analysis_summary": report.summary_text,
+            "static_analysis_history": [*state.get("static_analysis_history", []), report_dump],
+            "node_history": _append_history(state, "static_analysis"),
+        }
 
     def test_failure_analysis_node(state: WorkflowState) -> dict[str, Any]:
         test_loops = int(state.get("test_correction_loops", 0))
@@ -952,16 +1008,22 @@ def build_sdlc_workflow_graph(
                 "node_history": _append_history(state, "code_review"),
             }
 
+        static_rep: StaticAnalysisReport | None = None
         try:
             requirement = RequirementSpecification.model_validate(state["requirement_spec"])
             plan = ImplementationPlan.model_validate(state["implementation_plan"])
             patch_val = PatchValidationResult.model_validate(state["patch_validation"])
             sandbox_rep = SandboxRunReport.model_validate(state["sandbox_report"])
+            raw_static = state.get("static_analysis_report")
+            if isinstance(raw_static, dict):
+                static_rep = StaticAnalysisReport.model_validate(raw_static)
+
             result = review_agent.run(
                 requirement=requirement,
                 plan=plan,
                 patch_validation=patch_val,
                 sandbox_report=sandbox_rep,
+                static_analysis_report=static_rep,
                 static_analysis_summary=state.get("static_analysis_summary"),
                 is_private_repo=state["is_private_repo"],
                 llm_data_sharing=state["llm_data_sharing"],
@@ -978,12 +1040,21 @@ def build_sdlc_workflow_graph(
             }
 
         usage_update = _accumulate_usage(state, result.usage)
+        review_dump = result.report.model_dump(mode="json")
+        review_record = {
+            **review_dump,
+            "base_commit_sha": state["base_commit_sha"],
+            "patch_hash": state.get("patch_hash"),
+        }
+        review_history = [*state.get("code_review_history", []), review_record]
+
         if result.report.passed:
             return {
                 **usage_update,
                 "status": "running",
                 "current_node": "code_review",
-                "code_review_report": result.report.model_dump(mode="json"),
+                "code_review_report": review_dump,
+                "code_review_history": review_history,
                 "pending_correction_feedback": None,
                 "node_history": _append_history(state, "code_review"),
             }
@@ -998,7 +1069,8 @@ def build_sdlc_workflow_graph(
                 **usage_update,
                 "status": "failed",
                 "current_node": "code_review",
-                "code_review_report": result.report.model_dump(mode="json"),
+                "code_review_report": review_dump,
+                "code_review_history": review_history,
                 "error_code": "CORRECTION_LIMIT_EXCEEDED",
                 "error_message": (
                     "Code review correction loop limit reached "
@@ -1011,10 +1083,14 @@ def build_sdlc_workflow_graph(
             **usage_update,
             "status": "running",
             "current_node": "code_review",
-            "code_review_report": result.report.model_dump(mode="json"),
+            "code_review_report": review_dump,
+            "code_review_history": review_history,
             "review_correction_loops": review_loops + 1,
             "total_correction_loops": total_loops + 1,
-            "pending_correction_feedback": _format_review_correction_feedback(result.report),
+            "pending_correction_feedback": _format_review_correction_feedback(
+                result.report,
+                static_rep,
+            ),
             "node_history": _append_history(state, "code_review"),
         }
 
@@ -1040,6 +1116,7 @@ def build_sdlc_workflow_graph(
                 "test_integrity_flags": list(patch_val.get("test_integrity_flags", [])),
                 "scope_drift_files": list(patch_val.get("scope_drift_files", [])),
                 "sandbox_report": state.get("sandbox_report"),
+                "static_analysis_report": state.get("static_analysis_report"),
                 "code_review_report": state.get("code_review_report"),
                 "estimated_cost_usd": state.get("estimated_cost_usd", "0.000000"),
                 "cost_status": state.get("cost_status", "unavailable"),
@@ -1183,6 +1260,7 @@ def build_sdlc_workflow_graph(
     graph_builder.add_node("human_plan_approval", human_plan_approval_node)
     graph_builder.add_node("coding", coding_node)
     graph_builder.add_node("sandbox_test", sandbox_test_node)
+    graph_builder.add_node("static_analysis", static_analysis_node)
     graph_builder.add_node("test_failure_analysis", test_failure_analysis_node)
     graph_builder.add_node("code_review", code_review_node)
     graph_builder.add_node("human_commit_approval", human_commit_approval_node)
@@ -1229,10 +1307,15 @@ def build_sdlc_workflow_graph(
         "sandbox_test",
         route_after_sandbox_test,
         {
-            "code_review": "code_review",
+            "static_analysis": "static_analysis",
             "test_failure_analysis": "test_failure_analysis",
             "end": END,
         },
+    )
+    graph_builder.add_conditional_edges(
+        "static_analysis",
+        route_if_running("code_review"),
+        {"code_review": "code_review", "end": END},
     )
     graph_builder.add_conditional_edges(
         "test_failure_analysis",
@@ -1270,6 +1353,7 @@ class WorkflowOrchestrator:
         patch_service: PatchService,
         sandbox_client: SandboxClient,
         checkpointer: Any,
+        static_analysis_service: StaticAnalysisService | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._db = db
@@ -1283,6 +1367,7 @@ class WorkflowOrchestrator:
             patch_service=patch_service,
             sandbox_client=sandbox_client,
             checkpointer=checkpointer,
+            static_analysis_service=static_analysis_service,
             settings=self._settings,
         )
 
@@ -1325,6 +1410,12 @@ class WorkflowOrchestrator:
             "plan_approved": False,
             "approved_protected_paths": [],
             "touched_files": [],
+            "static_analysis_report": None,
+            "static_analysis_summary": None,
+            "code_change_history": [],
+            "test_execution_history": [],
+            "static_analysis_history": [],
+            "code_review_history": [],
             "commit_approved": False,
             "usage_records": [],
             "node_history": [],
@@ -1344,6 +1435,15 @@ class WorkflowOrchestrator:
         sandbox_raw = values.get("sandbox_report")
         sandbox_passed = (
             bool(sandbox_raw.get("passed")) if isinstance(sandbox_raw, dict) else None
+        )
+        static_raw = values.get("static_analysis_report")
+        static_passed = (
+            bool(static_raw.get("passed")) if isinstance(static_raw, dict) else None
+        )
+        static_blocking = (
+            int(static_raw.get("blocking_findings_count", 0))
+            if isinstance(static_raw, dict)
+            else 0
         )
         review_raw = values.get("code_review_report")
         review_passed = (
@@ -1384,6 +1484,8 @@ class WorkflowOrchestrator:
             review_correction_loops=int(values.get("review_correction_loops", 0)),
             total_correction_loops=int(values.get("total_correction_loops", 0)),
             sandbox_passed=sandbox_passed,
+            static_analysis_passed=static_passed,
+            static_analysis_blocking_count=static_blocking,
             review_passed=review_passed,
             commit_approved=bool(values.get("commit_approved", False)),
             pr_title=pr_title,
@@ -1529,7 +1631,6 @@ class WorkflowOrchestrator:
         existing_snapshot = self._graph.get_state(lookup_config)
         existing_values: dict[str, Any] = dict(getattr(existing_snapshot, "values", {}) or {})
         if existing_values:
-            # Duplicate queue delivery: checkpoint already exists, reconcile and return safely
             return self._sync_projection(
                 run=run,
                 checkpoint_snapshot=existing_snapshot,

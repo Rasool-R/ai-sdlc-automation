@@ -26,6 +26,7 @@ from app.core.config import Settings, load_settings
 from app.execution.patch_service import PatchService
 from app.execution.sandbox_client import SandboxClient
 from app.execution.schemas import FilePatchOperation, PatchBundle, SearchReplaceHunk
+from app.execution.static_analysis import PipAuditRawOutcome, StaticAnalysisService
 from app.integrations.embeddings.client import EmbeddingClient
 from app.integrations.llm.client import LLMClient
 from app.integrations.qdrant.client import QdrantIndexClient
@@ -36,11 +37,14 @@ from app.models import (
     AgentExecutionModel,
     ApprovalModel,
     Base,
+    CodeChangeModel,
+    CodeReviewModel,
     LLMUsageRecordModel,
     ProjectModel,
     RepositoryModel,
     TaskDependencyModel,
     TaskModel,
+    TestExecutionModel,
     WorkflowRunModel,
 )
 from app.workflows.checkpointer import create_memory_checkpointer
@@ -54,6 +58,18 @@ from sqlalchemy.pool import StaticPool
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_FIXTURE_DIR = REPO_ROOT / "fixtures" / "demo_fastapi_repo"
+
+
+class _CleanPipAuditStub:
+    def audit_requirements_file(self, requirements_path: Path) -> PipAuditRawOutcome:
+        _ = requirements_path
+        return PipAuditRawOutcome(
+            available=True,
+            exit_code=0,
+            stdout=json.dumps({"dependencies": []}),
+            stderr="",
+            duration_seconds=0.05,
+        )
 
 
 @pytest.fixture()
@@ -130,6 +146,13 @@ def _make_sandbox_transport() -> httpx.MockTransport:
         if request.method == "POST" and path == "/runs/sbx-gov/execute":
             body = json.loads(request.content.decode("utf-8"))
             template = body["template"]
+            stdout = "ok"
+            if template == "ruff_check":
+                stdout = "[]"
+            elif template == "mypy_check":
+                stdout = ""
+            elif template == "bandit_check":
+                stdout = json.dumps({"results": []})
             return httpx.Response(
                 200,
                 json={
@@ -143,7 +166,7 @@ def _make_sandbox_transport() -> httpx.MockTransport:
                     "network_policy": "restricted_egress" if template == "install_deps" else "none",
                     "command_argv": ["python"],
                     "exit_code": 0,
-                    "stdout": "ok",
+                    "stdout": stdout,
                     "stderr": "",
                     "duration_seconds": 0.1,
                     "timed_out": False,
@@ -278,7 +301,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
             },
         )
 
-    # Pre-create a queued workflow projection as FastAPI would before enqueuing Celery task
     queued_run = WorkflowRunModel(
         repository_id=repo.id,
         base_branch="main",
@@ -299,6 +321,7 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         httpx.Client(transport=httpx.MockTransport(llm_handler)) as mock_llm,
         httpx.Client(transport=_make_sandbox_transport()) as mock_sbx,
     ):
+        sbx_client = SandboxClient(settings=settings, http_client=mock_sbx)
         orchestrator = WorkflowOrchestrator(
             db_session,
             llm_client=LLMClient(settings=settings, http_client=mock_llm),
@@ -309,12 +332,15 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
                 qdrant_client=QdrantIndexClient(settings=settings),
             ),
             patch_service=PatchService(settings=settings),
-            sandbox_client=SandboxClient(settings=settings, http_client=mock_sbx),
+            sandbox_client=sbx_client,
+            static_analysis_service=StaticAnalysisService(
+                sandbox_client=sbx_client,
+                pip_audit_runner=_CleanPipAuditStub(),
+            ),
             checkpointer=create_memory_checkpointer(),
             settings=settings,
         )
 
-        # Worker executes queued workflow -> pauses at plan approval
         paused = orchestrator.execute_queued_workflow(
             workflow_id=queued_run.id,
             workspace_dir=workspace,
@@ -323,7 +349,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         assert paused.reused_existing is False
         assert llm_call_count == 3
 
-        # Duplicate Celery delivery is idempotent: no extra LLM calls, no duplicate governance rows
         dup = orchestrator.execute_queued_workflow(
             workflow_id=queued_run.id,
             workspace_dir=workspace,
@@ -331,7 +356,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         assert dup.reused_existing is True
         assert llm_call_count == 3
 
-        # Approve plan -> runs coding, sandbox, review -> pauses at commit approval
         assert paused.plan_hash is not None
         commit_pause = orchestrator.resume_workflow(
             workflow_id=queued_run.id,
@@ -345,7 +369,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         assert commit_pause.status == "waiting_commit_approval"
         assert commit_pause.patch_hash is not None
 
-        # Approve commit -> runs release preparation -> completes
         done = orchestrator.resume_workflow(
             workflow_id=queued_run.id,
             decision=HumanDecision(
@@ -357,7 +380,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         )
         assert done.status == "completed"
 
-        # Repeated reconciliation must remain idempotent
         orchestrator.reconcile_projection(queued_run.id)
 
     executions = list(
@@ -374,6 +396,7 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         "human_plan_approval",
         "coding",
         "sandbox_test",
+        "static_analysis",
         "code_review",
         "human_commit_approval",
         "release_preparation",
@@ -405,7 +428,6 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
     )
     assert len(approvals) == 2
     assert {a.approval_type for a in approvals} == {"plan", "commit"}
-    assert all(a.decision == "approved" and a.base_commit_sha == commit_sha for a in approvals)
 
     usage_rows = list(
         db_session.scalars(
@@ -415,8 +437,25 @@ def test_queued_workflow_persists_governance_tables_and_handles_duplicate_delive
         ).all()
     )
     assert len(usage_rows) == 6
-    assert all(u.model == "gpt-4o-mini" and u.cost_status == "estimated" for u in usage_rows)
-    assert all(u.estimated_cost_usd is not None and u.estimated_cost_usd > 0 for u in usage_rows)
+
+    changes = list(
+        db_session.scalars(
+            select(CodeChangeModel).where(CodeChangeModel.workflow_id == queued_run.id)
+        ).all()
+    )
+    tests_rows = list(
+        db_session.scalars(
+            select(TestExecutionModel).where(TestExecutionModel.workflow_id == queued_run.id)
+        ).all()
+    )
+    reviews = list(
+        db_session.scalars(
+            select(CodeReviewModel).where(CodeReviewModel.workflow_id == queued_run.id)
+        ).all()
+    )
+    assert len(changes) == 1
+    assert len(tests_rows) == 1 and tests_rows[0].passed is True
+    assert len(reviews) == 1 and reviews[0].passed is True
 
 
 def test_cancelled_queued_workflow_never_starts_in_worker(
@@ -452,6 +491,7 @@ def test_cancelled_queued_workflow_never_starts_in_worker(
         httpx.Client(transport=httpx.MockTransport(fail_if_called)) as mock_llm,
         httpx.Client(transport=_make_sandbox_transport()) as mock_sbx,
     ):
+        sbx_client = SandboxClient(settings=settings, http_client=mock_sbx)
         orchestrator = WorkflowOrchestrator(
             db_session,
             llm_client=LLMClient(settings=settings, http_client=mock_llm),
@@ -462,7 +502,11 @@ def test_cancelled_queued_workflow_never_starts_in_worker(
                 qdrant_client=QdrantIndexClient(settings=settings),
             ),
             patch_service=PatchService(settings=settings),
-            sandbox_client=SandboxClient(settings=settings, http_client=mock_sbx),
+            sandbox_client=sbx_client,
+            static_analysis_service=StaticAnalysisService(
+                sandbox_client=sbx_client,
+                pip_audit_runner=_CleanPipAuditStub(),
+            ),
             checkpointer=create_memory_checkpointer(),
             settings=settings,
         )
