@@ -23,6 +23,8 @@ SandboxTemplate = Literal[
     "bandit_check",
 ]
 
+DEFAULT_ANALYSIS_TOOLS: tuple[str, ...] = ("ruff", "mypy", "bandit")
+
 _EXCLUDED_ARCHIVE_DIRS: frozenset[str] = frozenset(
     {
         ".git",
@@ -64,6 +66,17 @@ class SandboxRunReport(BaseModel):
     install_result: SandboxExecutionResult | None = None
     test_result: SandboxExecutionResult | None = None
     executions: list[SandboxExecutionResult] = Field(default_factory=list)
+
+
+class SandboxStaticAnalysisRawReport(BaseModel):
+    """Raw sandbox execution outputs for deterministic offline static-analysis tools."""
+
+    run_id: str
+    workflow_id: str
+    repository_id: str
+    base_commit_sha: str
+    install_result: SandboxExecutionResult | None = None
+    tool_results: dict[str, SandboxExecutionResult] = Field(default_factory=dict)
 
 
 def package_workspace_archive(
@@ -349,5 +362,78 @@ class SandboxClient:
             except AppError as exc:
                 logger.warning(
                     "Failed to clean up sandbox run after completion",
+                    extra={"structured_data": {"run_id": run_id, "code": exc.code}},
+                )
+
+    def run_static_analysis(
+        self,
+        *,
+        workflow_id: str,
+        repository_id: str,
+        base_commit_sha: str,
+        workspace_dir: Path,
+        target_paths: list[str] | None = None,
+        install_dependencies: bool = True,
+        extra_analysis_packages: list[str] | None = None,
+    ) -> SandboxStaticAnalysisRawReport:
+        """Install project + analyzer deps, then run offline Ruff, Mypy, and Bandit."""
+        run_id = self.create_run(
+            workflow_id=workflow_id,
+            repository_id=repository_id,
+            base_commit_sha=base_commit_sha,
+        )
+        install_result: SandboxExecutionResult | None = None
+        tool_results: dict[str, SandboxExecutionResult] = {}
+        effective_targets = target_paths or ["."]
+        analyzer_pkgs = (
+            list(extra_analysis_packages)
+            if extra_analysis_packages is not None
+            else list(DEFAULT_ANALYSIS_TOOLS)
+        )
+
+        try:
+            self.upload_workspace(run_id, workspace_dir)
+
+            if install_dependencies:
+                install_result = self.execute_command(
+                    run_id,
+                    template="install_deps",
+                    extra_pip_packages=analyzer_pkgs,
+                )
+                if install_result.exit_code != 0:
+                    return SandboxStaticAnalysisRawReport(
+                        run_id=run_id,
+                        workflow_id=workflow_id,
+                        repository_id=repository_id,
+                        base_commit_sha=base_commit_sha,
+                        install_result=install_result,
+                        tool_results={},
+                    )
+
+            for tool_name, template in (
+                ("ruff", "ruff_check"),
+                ("mypy", "mypy_check"),
+                ("bandit", "bandit_check"),
+            ):
+                tool_results[tool_name] = self.execute_command(
+                    run_id,
+                    template=template,  # type: ignore[arg-type]
+                    target_paths=effective_targets,
+                )
+
+            return SandboxStaticAnalysisRawReport(
+                run_id=run_id,
+                workflow_id=workflow_id,
+                repository_id=repository_id,
+                base_commit_sha=base_commit_sha,
+                install_result=install_result,
+                tool_results=tool_results,
+            )
+        finally:
+            try:
+                self.destroy_run(run_id)
+            except AppError as exc:
+                logger.warning(
+                    "Failed to clean up static-analysis sandbox run",
                     extra={"structured_data": {"run_id": run_id, "code": exc.code}},
                 )

@@ -213,7 +213,6 @@ class SandboxRunManager:
         files_extracted = 0
         total_bytes = 0
 
-        # Reset workspace cleanly if re-uploaded before execution
         _safe_rmtree(state.workspace_dir)
         state.workspace_dir.mkdir(parents=True, exist_ok=True)
         workspace_root = state.workspace_dir.resolve()
@@ -326,6 +325,7 @@ class SandboxRunManager:
             pids_limit=state.pids_limit,
             timeout_seconds=effective_timeout,
             install_network=self._settings.SANDBOX_INSTALL_NETWORK,
+            seccomp_profile=self._settings.SANDBOX_SECCOMP_PROFILE,
         )
 
         state.status = "running"

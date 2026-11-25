@@ -30,6 +30,7 @@ class SandboxRunnerSettings(BaseSettings):
     SANDBOX_MAX_OUTPUT_CHARS: int = Field(default=200_000, ge=1024)
     SANDBOX_INTERNAL_TOKEN: str = ""
     SANDBOX_DOCKER_BIN: str = "docker"
+    SANDBOX_SECCOMP_PROFILE: str = ""
 
 
 @lru_cache(maxsize=1)

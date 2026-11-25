@@ -32,6 +32,7 @@ _SAFE_PACKAGE_SPEC_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:==[A-Za-z0-9._-]+)?$"
 )
 _SAFE_IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{1,254}$")
+_SAFE_SECCOMP_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
 
 _CONTAINER_TMPFS_SPEC = "/tmp:rw,noexec,nosuid,size=256m"  # noqa: S108  # nosec B108
 _CONTAINER_TMP_HOME = "/tmp"  # noqa: S108  # nosec B108
@@ -39,7 +40,10 @@ _CONTAINER_PYTEST_CACHE = "/tmp/pytest_cache"  # noqa: S108  # nosec B108
 _CONTAINER_RUFF_CACHE = "/tmp/ruff_cache"  # noqa: S108  # nosec B108
 _CONTAINER_MYPY_CACHE = "/tmp/mypy_cache"  # noqa: S108  # nosec B108
 
-# Platform-controlled dependency bootstrap script executed inside the Phase-1 container.
+# Platform-enforced Ruff rule categories; --isolated prevents repository config overrides.
+_PLATFORM_RUFF_RULES = "E,F,B,S,UP"
+
+# Platform-controlled dependency bootstrap script executed inside the install container.
 # Untrusted user strings are never interpolated into source code; validated args arrive via argv.
 _INSTALL_BOOTSTRAP_SCRIPT = """
 import pathlib, subprocess, sys
@@ -95,6 +99,7 @@ class ContainerExecutionSpec:
     pids_limit: int
     timeout_seconds: int
     install_network: str
+    seccomp_profile: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,11 +204,18 @@ def build_template_command(
 
     if template == "ruff_check":
         paths = safe_paths or ["."]
+        # --isolated prevents untrusted repo configs from weakening security/lint rules.
         argv = [
             "/sandbox_venv/bin/python",
             "-m",
             "ruff",
             "check",
+            "--isolated",
+            "--no-fix",
+            "--select",
+            _PLATFORM_RUFF_RULES,
+            "--output-format",
+            "json",
             "--cache-dir",
             _CONTAINER_RUFF_CACHE,
             *paths,
@@ -218,6 +230,11 @@ def build_template_command(
             "mypy",
             "--cache-dir",
             _CONTAINER_MYPY_CACHE,
+            "--no-color-output",
+            "--no-error-summary",
+            "--show-column-numbers",
+            "--show-error-codes",
+            "--ignore-missing-imports",
             *paths,
         ]
         return ("isolated_execution", "none", argv)
@@ -229,6 +246,9 @@ def build_template_command(
             "-m",
             "bandit",
             "-r",
+            "-f",
+            "json",
+            "-q",
             *paths,
         ]
         return ("isolated_execution", "none", argv)
@@ -244,6 +264,13 @@ def build_docker_run_argv(
     """Assemble hardened `docker run` CLI arguments without shell interpolation."""
     container_name = f"sdlc-sbx-{spec.run_id[:12]}-{spec.execution_id[:8]}"
     network_arg = "none" if spec.network_policy == "none" else spec.install_network
+
+    security_opts = ["--security-opt=no-new-privileges:true"]
+    seccomp = spec.seccomp_profile.strip()
+    if seccomp:
+        if ".." in seccomp or not _SAFE_SECCOMP_PATH_PATTERN.match(seccomp):
+            raise ValueError("Invalid seccomp profile path configured.")
+        security_opts.append(f"--security-opt=seccomp={seccomp}")
 
     argv = [
         docker_bin,
@@ -262,7 +289,7 @@ def build_docker_run_argv(
         "--pids-limit",
         str(spec.pids_limit),
         "--cap-drop=ALL",
-        "--security-opt=no-new-privileges:true",
+        *security_opts,
         "--read-only",
         "--user",
         "65534:65534",
