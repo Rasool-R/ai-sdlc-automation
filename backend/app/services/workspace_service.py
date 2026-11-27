@@ -17,6 +17,8 @@ from app.core.logging import redact_text
 logger = logging.getLogger(__name__)
 
 _WORKSPACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SAFE_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{1,126}[A-Za-z0-9]$")
+_FORBIDDEN_TARGET_BRANCHES: frozenset[str] = frozenset({"main", "master", "head"})
 _LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1"
 
 
@@ -30,6 +32,16 @@ class WorkspaceInfo(BaseModel):
     has_submodules: bool = False
     has_git_lfs: bool = False
     warnings: list[str] = Field(default_factory=list)
+
+
+class GitCommitPushResult(BaseModel):
+    """Auditable outcome of a controlled branch creation, commit, and non-force push."""
+
+    branch_name: str
+    base_commit_sha: str
+    commit_sha: str
+    pushed: bool
+    reused_existing_commit: bool = False
 
 
 class WorkspaceService:
@@ -58,6 +70,21 @@ class WorkspaceService:
                 details={"workspace_id": workspace_id},
             )
         return candidate
+
+    def _validate_feature_branch_name(self, branch_name: str, *, base_branch: str) -> str:
+        cleaned = branch_name.strip()
+        if (
+            not _SAFE_BRANCH_PATTERN.match(cleaned)
+            or ".." in cleaned
+            or "//" in cleaned
+            or cleaned.lower() in _FORBIDDEN_TARGET_BRANCHES
+            or cleaned == base_branch.strip()
+        ):
+            raise ValidationFailedError(
+                "Invalid or forbidden target feature branch name.",
+                details={"branch_name": branch_name, "base_branch": base_branch},
+            )
+        return cleaned
 
     def _directory_size_bytes(self, directory: Path) -> int:
         total = 0
@@ -220,7 +247,7 @@ class WorkspaceService:
                 repo.close()
 
     def verify_base_sha(self, *, workspace_id: str, expected_base_sha: str) -> str:
-        """Verify workspace HEAD matches expected_base_sha and working tree is clean."""
+        """Verify workspace HEAD matches expected_base_sha."""
         workspace_path = self._resolve_workspace_path(workspace_id)
         try:
             repo = Repo(str(workspace_path))
@@ -261,6 +288,160 @@ class WorkspaceService:
                     "current_remote_sha": current_remote_sha,
                 },
             )
+
+    def _ls_remote_branch_sha(self, repo: Repo, remote_url: str, branch_name: str) -> str | None:
+        raw_out = str(repo.git.ls_remote(remote_url, f"refs/heads/{branch_name}")).strip()
+        if not raw_out:
+            return None
+        first_line = raw_out.splitlines()[0].strip()
+        parts = first_line.split()
+        return parts[0] if parts else None
+
+    def create_branch_commit_and_push(
+        self,
+        *,
+        workspace_id: str,
+        branch_name: str,
+        base_branch: str,
+        expected_base_sha: str,
+        commit_message: str,
+        remote_push_url: str | None = None,
+        author_name: str = "AI SDLC Automation",
+        author_email: str = "ai-sdlc-bot@users.noreply.local",
+    ) -> GitCommitPushResult:
+        """Idempotently create feature branch, commit validated changes, and push non-force.
+
+        Remote push credentials are passed ephemerally to git commands and never written
+        to .git/config. Force-push is strictly forbidden.
+        """
+        safe_branch = self._validate_feature_branch_name(branch_name, base_branch=base_branch)
+        workspace_path = self._resolve_workspace_path(workspace_id)
+        try:
+            repo = Repo(str(workspace_path))
+        except InvalidGitRepositoryError as exc:
+            raise ValidationFailedError(
+                "Workspace does not contain a valid Git repository.",
+                details={"workspace_id": workspace_id},
+            ) from exc
+
+        try:
+            current_sha = str(repo.head.commit.hexsha)
+            is_detached = repo.head.is_detached
+            active_branch = None if is_detached else str(repo.active_branch.name)
+
+            reused_existing_commit = False
+            commit_sha: str
+
+            if active_branch == safe_branch and not repo.is_dirty(untracked_files=True):
+                parent_shas = [str(p.hexsha) for p in repo.head.commit.parents]
+                if expected_base_sha not in parent_shas:
+                    raise ConflictError(
+                        "Existing local feature branch is not parented at expected base SHA.",
+                        details={
+                            "branch_name": safe_branch,
+                            "expected_base_sha": expected_base_sha,
+                            "parent_shas": parent_shas,
+                        },
+                    )
+                commit_sha = current_sha
+                reused_existing_commit = True
+            else:
+                if current_sha != expected_base_sha:
+                    raise ConflictError(
+                        "Workspace HEAD drifted from expected base_commit_sha before commit.",
+                        details={
+                            "expected_base_sha": expected_base_sha,
+                            "actual_sha": current_sha,
+                        },
+                    )
+
+                if not repo.is_dirty(untracked_files=True):
+                    raise ValidationFailedError(
+                        "Workspace has no modified or untracked files to commit.",
+                        details={"workspace_id": workspace_id},
+                    )
+
+                if safe_branch in [h.name for h in repo.heads]:
+                    repo.git.checkout(safe_branch)
+                else:
+                    repo.git.checkout("-b", safe_branch)
+
+                with repo.config_writer() as cfg:
+                    cfg.set_value("user", "name", author_name)
+                    cfg.set_value("user", "email", author_email)
+
+                repo.git.add(A=True)
+                commit_obj = repo.index.commit(commit_message)
+                commit_sha = str(commit_obj.hexsha)
+
+            pushed = False
+            if remote_push_url:
+                remote_base_sha = self._ls_remote_branch_sha(repo, remote_push_url, base_branch)
+                if remote_base_sha is not None:
+                    self.detect_stale_base(
+                        expected_base_sha=expected_base_sha,
+                        current_remote_sha=remote_base_sha,
+                        branch_name=base_branch,
+                    )
+
+                remote_head_sha = self._ls_remote_branch_sha(repo, remote_push_url, safe_branch)
+                if remote_head_sha is not None:
+                    if remote_head_sha == commit_sha:
+                        return GitCommitPushResult(
+                            branch_name=safe_branch,
+                            base_commit_sha=expected_base_sha,
+                            commit_sha=commit_sha,
+                            pushed=True,
+                            reused_existing_commit=reused_existing_commit,
+                        )
+                    raise ConflictError(
+                        f"Remote branch '{safe_branch}' already exists with commit "
+                        f"'{remote_head_sha}'; force-push is forbidden without human approval.",
+                        details={
+                            "branch_name": safe_branch,
+                            "remote_head_sha": remote_head_sha,
+                            "local_commit_sha": commit_sha,
+                        },
+                    )
+
+                # Non-force push passing ephemeral URL directly so no token is saved in .git/config
+                repo.git.push(remote_push_url, f"HEAD:refs/heads/{safe_branch}")
+                pushed = True
+
+            return GitCommitPushResult(
+                branch_name=safe_branch,
+                base_commit_sha=expected_base_sha,
+                commit_sha=commit_sha,
+                pushed=pushed,
+                reused_existing_commit=reused_existing_commit,
+            )
+        except (ConflictError, ValidationFailedError):
+            raise
+        except GitCommandError as exc:
+            safe_stderr = redact_text(str(exc.stderr or exc))
+            logger.error(
+                "Git commit/push operation failed",
+                extra={
+                    "structured_data": {
+                        "workspace_id": workspace_id,
+                        "branch_name": safe_branch,
+                        "error": safe_stderr,
+                    }
+                },
+            )
+            if "non-fast-forward" in safe_stderr.lower() or "rejected" in safe_stderr.lower():
+                raise ConflictError(
+                    "Remote rejected non-fast-forward branch update; force-push is forbidden.",
+                    details={"branch_name": safe_branch},
+                ) from exc
+            raise AppError(
+                "Failed to commit or push changes from isolated workspace.",
+                code="GIT_DELIVERY_ERROR",
+                status_code=502,
+                details={"workspace_id": workspace_id, "branch_name": safe_branch},
+            ) from exc
+        finally:
+            repo.close()
 
     def cleanup_workspace(self, workspace_id: str) -> bool:
         """Remove an isolated workspace directory safely on all platforms including Windows."""

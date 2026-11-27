@@ -2,6 +2,7 @@
 
 from app.db.base import Base
 from app.models.audit import AuditLogModel
+from app.models.delivery import PullRequestModel, WorkflowArtifactModel
 from app.models.execution import (
     CodeChangeModel,
     CodeReviewModel,
@@ -40,6 +41,7 @@ __all__ = [
     "CodeSymbolModel",
     "LLMUsageRecordModel",
     "ProjectModel",
+    "PullRequestModel",
     "RepositoryIndexSnapshotModel",
     "RepositoryLockModel",
     "RepositoryModel",
@@ -49,5 +51,6 @@ __all__ = [
     "TaskModel",
     "TestExecutionModel",
     "UserModel",
+    "WorkflowArtifactModel",
     "WorkflowRunModel",
 ]

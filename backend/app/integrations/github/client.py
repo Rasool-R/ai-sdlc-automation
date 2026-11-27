@@ -23,6 +23,14 @@ from app.core.exceptions import (
     ResourceNotFoundError,
     ValidationFailedError,
 )
+from app.integrations.github.pr_schemas import (
+    CIStatusState,
+    GitHubCheckRunSummary,
+    GitHubPullRequestInfo,
+    GitHubPullRequestStatusSnapshot,
+    GitHubReviewSummary,
+    ReviewDecisionState,
+)
 from app.integrations.github.schemas import (
     GitHubBranchInfo,
     GitHubCommitInfo,
@@ -35,9 +43,78 @@ logger = logging.getLogger(__name__)
 GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_GITHUB_API_BASE = "https://api.github.com"
 
+_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
+    {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
+)
+_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"success", "neutral", "skipped"})
+
+
+def _parse_pr_dict(data: dict[str, Any]) -> GitHubPullRequestInfo:
+    raw_head = data.get("head")
+    head: dict[str, Any] = raw_head if isinstance(raw_head, dict) else {}
+    raw_base = data.get("base")
+    base: dict[str, Any] = raw_base if isinstance(raw_base, dict) else {}
+    return GitHubPullRequestInfo(
+        number=int(data["number"]),
+        title=str(data.get("title", "")),
+        body=str(data.get("body") or ""),
+        state=str(data.get("state", "open")),
+        draft=bool(data.get("draft", False)),
+        html_url=str(data.get("html_url", "")),
+        head_branch=str(head.get("ref", "")),
+        head_sha=str(head.get("sha", "")),
+        base_branch=str(base.get("ref", "")),
+        base_sha=str(base.get("sha", "")),
+        merged=bool(data.get("merged", False)),
+    )
+
+
+def _derive_review_decision(reviews: list[GitHubReviewSummary]) -> ReviewDecisionState:
+    latest_by_reviewer: dict[str, str] = {}
+    for item in reviews:
+        state_upper = item.state.strip().upper()
+        if state_upper in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}:
+            latest_by_reviewer[item.reviewer] = state_upper
+
+    states = set(latest_by_reviewer.values())
+    if "CHANGES_REQUESTED" in states:
+        return "changes_requested"
+    if "APPROVED" in states:
+        return "approved"
+    if "COMMENTED" in states:
+        return "commented"
+    return "pending"
+
+
+def _derive_ci_status(
+    checks: list[GitHubCheckRunSummary],
+    combined_status_state: str | None,
+) -> CIStatusState:
+    if checks:
+        if any((c.conclusion or "").lower() in _FAILURE_CONCLUSIONS for c in checks):
+            return "failure"
+        if any(c.status.lower() != "completed" for c in checks):
+            return "pending"
+        if all((c.conclusion or "").lower() in _SUCCESS_CONCLUSIONS for c in checks):
+            return "success"
+
+    if combined_status_state:
+        lower = combined_status_state.strip().lower()
+        if lower in {"failure", "error"}:
+            return "failure"
+        if lower == "pending":
+            return "pending"
+        if lower == "success":
+            return "success"
+
+    return "unknown"
+
 
 class GitHubClient:
-    """Read-only and controlled repository inspection client for GitHub REST API."""
+    """Controlled GitHub REST API client for repository inspection and PR preparation.
+
+    Intentionally exposes NO pull-request merge, auto-merge, or deployment methods.
+    """
 
     def __init__(
         self,
@@ -173,12 +250,12 @@ class GitHubClient:
             "X-GitHub-Api-Version": GITHUB_API_VERSION,
         }
 
-    def _parse_json_response(
+    def _parse_json_any(
         self,
         response: httpx.Response,
         *,
         resource: str,
-    ) -> dict[str, Any]:
+    ) -> Any:
         if response.status_code == 401:
             raise AuthenticationError(
                 "GitHub rejected authentication credentials.",
@@ -203,7 +280,7 @@ class GitHubClient:
             )
 
         try:
-            payload = response.json()
+            return response.json()
         except ValueError as exc:
             raise AppError(
                 "GitHub API returned invalid JSON payload.",
@@ -212,6 +289,13 @@ class GitHubClient:
                 details={"resource": resource},
             ) from exc
 
+    def _parse_json_response(
+        self,
+        response: httpx.Response,
+        *,
+        resource: str,
+    ) -> dict[str, Any]:
+        payload = self._parse_json_any(response, resource=resource)
         if not isinstance(payload, dict):
             raise AppError(
                 "Unexpected GitHub API JSON structure.",
@@ -220,6 +304,22 @@ class GitHubClient:
                 details={"resource": resource},
             )
         return payload
+
+    def _parse_json_list(
+        self,
+        response: httpx.Response,
+        *,
+        resource: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._parse_json_any(response, resource=resource)
+        if not isinstance(payload, list):
+            raise AppError(
+                "Unexpected GitHub API JSON list structure.",
+                code="GITHUB_INVALID_RESPONSE",
+                status_code=502,
+                details={"resource": resource},
+            )
+        return [item for item in payload if isinstance(item, dict)]
 
     def _get(
         self,
@@ -233,6 +333,48 @@ class GitHubClient:
         url = f"{self._api_base_url}{path}"
         try:
             response = self._http.get(url, headers=headers, params=params)
+        except httpx.HTTPError as exc:
+            raise AppError(
+                "Network error communicating with GitHub API.",
+                code="GITHUB_CONNECTION_ERROR",
+                status_code=502,
+                details={"resource": resource, "reason": type(exc).__name__},
+            ) from exc
+        return self._parse_json_response(response, resource=resource)
+
+    def _get_list(
+        self,
+        path: str,
+        *,
+        resource: str,
+        installation_id: str | None = None,
+        params: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        headers = self._request_headers(installation_id=installation_id)
+        url = f"{self._api_base_url}{path}"
+        try:
+            response = self._http.get(url, headers=headers, params=params)
+        except httpx.HTTPError as exc:
+            raise AppError(
+                "Network error communicating with GitHub API.",
+                code="GITHUB_CONNECTION_ERROR",
+                status_code=502,
+                details={"resource": resource, "reason": type(exc).__name__},
+            ) from exc
+        return self._parse_json_list(response, resource=resource)
+
+    def _post(
+        self,
+        path: str,
+        *,
+        resource: str,
+        json_body: dict[str, Any],
+        installation_id: str | None = None,
+    ) -> dict[str, Any]:
+        headers = self._request_headers(installation_id=installation_id)
+        url = f"{self._api_base_url}{path}"
+        try:
+            response = self._http.post(url, headers=headers, json=json_body)
         except httpx.HTTPError as exc:
             raise AppError(
                 "Network error communicating with GitHub API.",
@@ -279,8 +421,9 @@ class GitHubClient:
             resource=f"{full_name}@{branch_name}",
             installation_id=installation_id,
         )
-        commit_obj = data.get("commit", {})
-        commit_sha = str(commit_obj.get("sha", "")) if isinstance(commit_obj, dict) else ""
+        raw_commit = data.get("commit")
+        commit_obj: dict[str, Any] = raw_commit if isinstance(raw_commit, dict) else {}
+        commit_sha = str(commit_obj.get("sha", ""))
         return GitHubBranchInfo(
             name=str(data["name"]),
             commit_sha=commit_sha,
@@ -396,6 +539,185 @@ class GitHubClient:
                 "File is binary or not valid UTF-8 text.",
                 details={"file_path": normalized_path},
             ) from exc
+
+    def find_open_pull_request(
+        self,
+        full_name: str,
+        *,
+        head_branch: str,
+        base_branch: str,
+        installation_id: str | None = None,
+    ) -> GitHubPullRequestInfo | None:
+        """Check whether an open Pull Request already exists for (head_branch -> base_branch)."""
+        owner, repo = self._validate_full_name(full_name)
+        items = self._get_list(
+            f"/repos/{quote(owner)}/{quote(repo)}/pulls",
+            resource=f"{full_name}:pulls:{head_branch}",
+            installation_id=installation_id,
+            params={
+                "state": "open",
+                "head": f"{owner}:{head_branch}",
+                "base": base_branch,
+            },
+        )
+        if not items:
+            return None
+        return _parse_pr_dict(items[0])
+
+    def create_pull_request(
+        self,
+        full_name: str,
+        *,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_branch: str,
+        draft: bool = False,
+        installation_id: str | None = None,
+    ) -> tuple[GitHubPullRequestInfo, bool]:
+        """Idempotently create or retrieve an open Pull Request.
+
+        Returns (pull_request_info, reused_existing).
+        """
+        existing = self.find_open_pull_request(
+            full_name,
+            head_branch=head_branch,
+            base_branch=base_branch,
+            installation_id=installation_id,
+        )
+        if existing is not None:
+            return existing, True
+
+        owner, repo = self._validate_full_name(full_name)
+        data = self._post(
+            f"/repos/{quote(owner)}/{quote(repo)}/pulls",
+            resource=f"{full_name}:create_pull:{head_branch}",
+            json_body={
+                "title": title,
+                "body": body,
+                "head": head_branch,
+                "base": base_branch,
+                "draft": draft,
+            },
+            installation_id=installation_id,
+        )
+        return _parse_pr_dict(data), False
+
+    def get_pull_request(
+        self,
+        full_name: str,
+        pr_number: int,
+        *,
+        installation_id: str | None = None,
+    ) -> GitHubPullRequestInfo:
+        """Fetch current metadata for an existing Pull Request."""
+        owner, repo = self._validate_full_name(full_name)
+        data = self._get(
+            f"/repos/{quote(owner)}/{quote(repo)}/pulls/{pr_number}",
+            resource=f"{full_name}#{pr_number}",
+            installation_id=installation_id,
+        )
+        return _parse_pr_dict(data)
+
+    def get_pull_request_status(
+        self,
+        full_name: str,
+        pr_number: int,
+        *,
+        installation_id: str | None = None,
+    ) -> GitHubPullRequestStatusSnapshot:
+        """Fetch PR details, review states, and CI check/commit status on demand."""
+        owner, repo = self._validate_full_name(full_name)
+        pr_info = self.get_pull_request(
+            full_name,
+            pr_number,
+            installation_id=installation_id,
+        )
+
+        raw_reviews = self._get_list(
+            f"/repos/{quote(owner)}/{quote(repo)}/pulls/{pr_number}/reviews",
+            resource=f"{full_name}#{pr_number}:reviews",
+            installation_id=installation_id,
+        )
+        reviews: list[GitHubReviewSummary] = []
+        for item in raw_reviews:
+            raw_user = item.get("user")
+            user_obj: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+            reviewer = str(user_obj.get("login", "unknown"))
+            state_str = str(item.get("state", "PENDING"))
+            submitted_at: datetime | None = None
+            raw_sub = item.get("submitted_at")
+            if isinstance(raw_sub, str):
+                try:
+                    submitted_at = datetime.fromisoformat(raw_sub.replace("Z", "+00:00"))
+                except ValueError:
+                    submitted_at = None
+            reviews.append(
+                GitHubReviewSummary(
+                    reviewer=reviewer,
+                    state=state_str,
+                    submitted_at=submitted_at,
+                )
+            )
+
+        checks: list[GitHubCheckRunSummary] = []
+        combined_state: str | None = None
+        if pr_info.head_sha:
+            try:
+                check_data = self._get(
+                    f"/repos/{quote(owner)}/{quote(repo)}/commits/{quote(pr_info.head_sha)}/check-runs",
+                    resource=f"{full_name}@{pr_info.head_sha}:check-runs",
+                    installation_id=installation_id,
+                )
+                raw_runs = check_data.get("check_runs", [])
+                if isinstance(raw_runs, list):
+                    for run in raw_runs:
+                        if not isinstance(run, dict):
+                            continue
+                        checks.append(
+                            GitHubCheckRunSummary(
+                                name=str(run.get("name", "check")),
+                                status=str(run.get("status", "unknown")),
+                                conclusion=(
+                                    str(run["conclusion"])
+                                    if run.get("conclusion") is not None
+                                    else None
+                                ),
+                                details_url=(
+                                    str(run["details_url"])
+                                    if run.get("details_url") is not None
+                                    else None
+                                ),
+                            )
+                        )
+            except AppError as exc:
+                logger.warning(
+                    "Unable to retrieve GitHub check runs",
+                    extra={"structured_data": {"repo": full_name, "code": exc.code}},
+                )
+
+            try:
+                status_data = self._get(
+                    f"/repos/{quote(owner)}/{quote(repo)}/commits/{quote(pr_info.head_sha)}/status",
+                    resource=f"{full_name}@{pr_info.head_sha}:status",
+                    installation_id=installation_id,
+                )
+                raw_state = status_data.get("state")
+                if isinstance(raw_state, str):
+                    combined_state = raw_state
+            except AppError as exc:
+                logger.warning(
+                    "Unable to retrieve GitHub combined commit status",
+                    extra={"structured_data": {"repo": full_name, "code": exc.code}},
+                )
+
+        return GitHubPullRequestStatusSnapshot(
+            pull_request=pr_info,
+            ci_status=_derive_ci_status(checks, combined_state),
+            review_decision=_derive_review_decision(reviews),
+            checks=checks,
+            reviews=reviews,
+        )
 
     def build_authenticated_clone_url(
         self,
