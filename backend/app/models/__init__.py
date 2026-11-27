@@ -3,6 +3,7 @@
 from app.db.base import Base
 from app.models.audit import AuditLogModel
 from app.models.delivery import PullRequestModel, WorkflowArtifactModel
+from app.models.event import WorkflowEventModel
 from app.models.execution import (
     CodeChangeModel,
     CodeReviewModel,
@@ -52,5 +53,6 @@ __all__ = [
     "TestExecutionModel",
     "UserModel",
     "WorkflowArtifactModel",
+    "WorkflowEventModel",
     "WorkflowRunModel",
 ]

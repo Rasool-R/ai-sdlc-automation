@@ -7,12 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from cryptography.fernet import Fernet
-from git import Repo
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from app.agents.schemas import (
     AcceptanceCriterion,
     CodeEvidenceReference,
@@ -54,6 +48,11 @@ from app.workflows.tasks import (
     resume_workflow_job,
     workflow_workspace_id,
 )
+from cryptography.fernet import Fernet
+from git import Repo
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_FIXTURE_DIR = REPO_ROOT / "fixtures" / "demo_fastapi_repo"

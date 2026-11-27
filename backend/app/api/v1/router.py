@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     artifacts,
     auth,
+    events,
     health,
     projects,
     pull_requests,
@@ -22,3 +23,4 @@ api_v1_router.include_router(workflows.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(pull_requests.router)
 api_v1_router.include_router(artifacts.router)
+api_v1_router.include_router(events.router)
