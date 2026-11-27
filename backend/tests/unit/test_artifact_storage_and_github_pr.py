@@ -9,18 +9,17 @@ from pathlib import Path
 
 import httpx
 import pytest
-from cryptography.fernet import Fernet
-from git import Repo
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from app.core.config import load_settings
 from app.core.exceptions import AuthorizationError, ConflictError, ValidationFailedError
 from app.integrations.github.client import GitHubClient
 from app.models import Base, ProjectModel, RepositoryModel, WorkflowRunModel
 from app.services.artifact_storage import ArtifactService, LocalArtifactStorage
 from app.services.workspace_service import WorkspaceService
+from cryptography.fernet import Fernet
+from git import Repo
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_FIXTURE_DIR = REPO_ROOT / "fixtures" / "demo_fastapi_repo"

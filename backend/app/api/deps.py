@@ -14,6 +14,7 @@ from app.integrations.embeddings.client import EmbeddingClient
 from app.integrations.github.client import GitHubClient
 from app.integrations.qdrant.client import QdrantIndexClient
 from app.schemas.auth import OperatorIdentity
+from app.services.artifact_storage import ArtifactStorage, LocalArtifactStorage
 from app.services.workspace_service import WorkspaceService
 from app.workflows.tasks import CeleryWorkflowDispatcher, WorkflowJobDispatcher
 
@@ -45,6 +46,11 @@ def get_workspace_service() -> WorkspaceService:
     return WorkspaceService()
 
 
+def get_artifact_storage() -> ArtifactStorage:
+    """Provide the configured ArtifactStorage backend (local adapter by default)."""
+    return LocalArtifactStorage()
+
+
 def get_embedding_client() -> Generator[EmbeddingClient, None, None]:
     """Provide a request-scoped EmbeddingClient instance and ensure clean shutdown."""
     client = EmbeddingClient()
@@ -68,6 +74,7 @@ CurrentOperator = Annotated[OperatorIdentity, Depends(get_current_operator)]
 DbSession = Annotated[Session, Depends(get_db)]
 GitHubClientDep = Annotated[GitHubClient, Depends(get_github_client)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
+ArtifactStorageDep = Annotated[ArtifactStorage, Depends(get_artifact_storage)]
 EmbeddingClientDep = Annotated[EmbeddingClient, Depends(get_embedding_client)]
 QdrantClientDep = Annotated[QdrantIndexClient, Depends(get_qdrant_client)]
 WorkflowDispatcherDep = Annotated[WorkflowJobDispatcher, Depends(get_workflow_dispatcher)]
