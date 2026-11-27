@@ -25,6 +25,7 @@ from app.core.logging import workflow_id_ctx
 from app.db.session import SessionLocal
 from app.execution.patch_service import PatchService
 from app.execution.sandbox_client import SandboxClient
+from app.execution.static_analysis import StaticAnalysisService
 from app.integrations.embeddings.client import EmbeddingClient
 from app.integrations.github.client import GitHubClient
 from app.integrations.llm.client import LLMClient
@@ -34,6 +35,8 @@ from app.intelligence.retrieval import HybridRetrievalService
 from app.models.intelligence import RepositoryIndexSnapshotModel
 from app.models.repository import RepositoryModel
 from app.models.workflow import WorkflowRunModel
+from app.services.artifact_storage import ArtifactService, ArtifactStorage, LocalArtifactStorage
+from app.services.delivery_service import ReleaseDeliveryService
 from app.services.lock_service import RepositoryLockService
 from app.services.workspace_service import WorkspaceService
 from app.workflows.celery_app import celery_app
@@ -178,10 +181,13 @@ def execute_workflow_job(
     settings: Settings | None = None,
     github_client: GitHubClient | None = None,
     workspace_service: WorkspaceService | None = None,
+    artifact_storage: ArtifactStorage | None = None,
+    delivery_service: ReleaseDeliveryService | None = None,
     llm_client: LLMClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     qdrant_client: QdrantIndexClient | None = None,
     sandbox_client: SandboxClient | None = None,
+    static_analysis_service: StaticAnalysisService | None = None,
     checkpointer: Any | None = None,
 ) -> WorkflowExecutionSnapshot:
     """Execute a queued workflow idempotently under a repository lock."""
@@ -210,6 +216,18 @@ def execute_workflow_job(
     emb = embedding_client or EmbeddingClient(settings=resolved_settings)
     qdrant = qdrant_client or QdrantIndexClient(settings=resolved_settings)
     sbx = sandbox_client or SandboxClient(settings=resolved_settings)
+
+    resolved_storage = artifact_storage or LocalArtifactStorage(settings=resolved_settings)
+    resolved_delivery = delivery_service or ReleaseDeliveryService(
+        db,
+        github_client=gh,
+        workspace_service=ws,
+        artifact_service=ArtifactService(
+            db,
+            storage=resolved_storage,
+            settings=resolved_settings,
+        ),
+    )
 
     locks = RepositoryLockService(db)
     lock_owner = f"worker:start:{workflow_id}:{uuid.uuid4().hex[:8]}"
@@ -241,12 +259,15 @@ def execute_workflow_job(
                     ),
                     patch_service=PatchService(settings=resolved_settings),
                     sandbox_client=sbx,
+                    static_analysis_service=static_analysis_service,
+                    delivery_service=resolved_delivery,
                     checkpointer=saver,
                     settings=resolved_settings,
                 )
                 return orchestrator.execute_queued_workflow(
                     workflow_id=workflow_id,
                     workspace_dir=ws.root_dir / ws_id,
+                    workspace_id=ws_id,
                 )
 
         ws_path = _ensure_workflow_workspace(
@@ -272,12 +293,15 @@ def execute_workflow_job(
                 ),
                 patch_service=PatchService(settings=resolved_settings),
                 sandbox_client=sbx,
+                static_analysis_service=static_analysis_service,
+                delivery_service=resolved_delivery,
                 checkpointer=saver,
                 settings=resolved_settings,
             )
             snapshot = orchestrator.execute_queued_workflow(
                 workflow_id=workflow_id,
                 workspace_dir=ws_path,
+                workspace_id=ws_id,
             )
 
         if snapshot.status in _TERMINAL_STATUSES:
@@ -307,10 +331,13 @@ def resume_workflow_job(
     settings: Settings | None = None,
     github_client: GitHubClient | None = None,
     workspace_service: WorkspaceService | None = None,
+    artifact_storage: ArtifactStorage | None = None,
+    delivery_service: ReleaseDeliveryService | None = None,
     llm_client: LLMClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     qdrant_client: QdrantIndexClient | None = None,
     sandbox_client: SandboxClient | None = None,
+    static_analysis_service: StaticAnalysisService | None = None,
     checkpointer: Any | None = None,
 ) -> WorkflowExecutionSnapshot:
     """Resume a paused workflow from its checkpoint under a repository lock."""
@@ -339,6 +366,18 @@ def resume_workflow_job(
     emb = embedding_client or EmbeddingClient(settings=resolved_settings)
     qdrant = qdrant_client or QdrantIndexClient(settings=resolved_settings)
     sbx = sandbox_client or SandboxClient(settings=resolved_settings)
+
+    resolved_storage = artifact_storage or LocalArtifactStorage(settings=resolved_settings)
+    resolved_delivery = delivery_service or ReleaseDeliveryService(
+        db,
+        github_client=gh,
+        workspace_service=ws,
+        artifact_service=ArtifactService(
+            db,
+            storage=resolved_storage,
+            settings=resolved_settings,
+        ),
+    )
 
     locks = RepositoryLockService(db)
     lock_owner = f"worker:resume:{workflow_id}:{uuid.uuid4().hex[:8]}"
@@ -380,6 +419,8 @@ def resume_workflow_job(
                 ),
                 patch_service=PatchService(settings=resolved_settings),
                 sandbox_client=sbx,
+                static_analysis_service=static_analysis_service,
+                delivery_service=resolved_delivery,
                 checkpointer=saver,
                 settings=resolved_settings,
             )

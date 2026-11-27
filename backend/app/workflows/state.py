@@ -70,7 +70,9 @@ class WorkflowState(TypedDict, total=False):
     tracing_enabled: bool
     base_branch: str
     base_commit_sha: str
+    workspace_id: str
     workspace_dir: str
+    created_by: str
     title: str
     request_text: str
     cost_limit_usd: str
@@ -118,6 +120,8 @@ class WorkflowState(TypedDict, total=False):
     commit_approved: bool
     commit_approval_record: dict[str, Any] | None
     release_output: dict[str, Any] | None
+    pull_request_delivery: dict[str, Any] | None
+    artifact_ids: list[str]
 
     cancelled_by: str | None
     cancel_reason: str | None
@@ -155,6 +159,9 @@ class WorkflowExecutionSnapshot(BaseModel):
     review_passed: bool | None = None
     commit_approved: bool = False
     pr_title: str | None = None
+    pr_number: int | None = None
+    pr_url: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
     error_code: str | None = None
     error_message: str | None = None
     node_history: list[str] = Field(default_factory=list)

@@ -62,6 +62,7 @@ from app.models.repository import RepositoryModel
 from app.models.workflow import WorkflowRunModel
 from app.observability.tracing import build_langgraph_run_config
 from app.services.audit_service import AuditService
+from app.services.delivery_service import ReleaseDeliveryService
 from app.workflows.governance import WorkflowGovernanceRecorder
 from app.workflows.state import (
     WORKFLOW_STATE_SCHEMA_VERSION,
@@ -393,6 +394,7 @@ def build_sdlc_workflow_graph(
     sandbox_client: SandboxClient,
     checkpointer: Any,
     static_analysis_service: StaticAnalysisService | None = None,
+    delivery_service: ReleaseDeliveryService | None = None,
     settings: Settings | None = None,
 ) -> Any:
     """Compile the deterministic seven-agent SDLC LangGraph StateGraph."""
@@ -1243,11 +1245,72 @@ def build_sdlc_workflow_graph(
             }
 
         usage_update = _accumulate_usage(state, result.usage)
+        release_dump = result.output.model_dump(mode="json")
+        artifact_ids: list[str] = list(state.get("artifact_ids", []))
+        pr_delivery_dump: dict[str, Any] | None = None
+
+        if delivery_service is not None:
+            created_by = str(state.get("created_by") or "operator")
+            approval_rec = state.get("commit_approval_record")
+            approver = (
+                str(approval_rec["actor"])
+                if isinstance(approval_rec, dict) and approval_rec.get("actor")
+                else created_by
+            )
+            workspace_id = str(state.get("workspace_id") or Path(state["workspace_dir"]).name)
+            patch_hash = str(state.get("patch_hash") or patch_val.patch_hash)
+
+            try:
+                artifact_ids = delivery_service.persist_workflow_artifacts(
+                    workflow_id=state["workflow_id"],
+                    created_by=created_by,
+                    unified_diff=patch_val.unified_diff,
+                    sandbox_report=state.get("sandbox_report"),
+                    static_analysis_report=state.get("static_analysis_report"),
+                    code_review_report=state.get("code_review_report"),
+                    release_output=release_dump,
+                )
+            except AppError as exc:
+                return {
+                    **usage_update,
+                    "status": "failed",
+                    "current_node": "release_preparation",
+                    "release_output": release_dump,
+                    "error_code": exc.code,
+                    "error_message": exc.message,
+                    "node_history": _append_history(state, "release_preparation"),
+                }
+
+            try:
+                pr_delivery = delivery_service.deliver_pull_request(
+                    workflow_id=state["workflow_id"],
+                    workspace_id=workspace_id,
+                    base_commit_sha=state["base_commit_sha"],
+                    patch_hash=patch_hash,
+                    commit_approved=True,
+                    release_output=result.output,
+                    actor=approver,
+                )
+                pr_delivery_dump = pr_delivery.model_dump(mode="json")
+            except AppError as exc:
+                return {
+                    **usage_update,
+                    "status": "failed",
+                    "current_node": "release_preparation",
+                    "release_output": release_dump,
+                    "artifact_ids": artifact_ids,
+                    "error_code": exc.code,
+                    "error_message": exc.message,
+                    "node_history": _append_history(state, "release_preparation"),
+                }
+
         return {
             **usage_update,
             "status": "completed",
             "current_node": "release_preparation",
-            "release_output": result.output.model_dump(mode="json"),
+            "release_output": release_dump,
+            "pull_request_delivery": pr_delivery_dump,
+            "artifact_ids": artifact_ids,
             "node_history": _append_history(state, "release_preparation"),
         }
 
@@ -1354,6 +1417,7 @@ class WorkflowOrchestrator:
         sandbox_client: SandboxClient,
         checkpointer: Any,
         static_analysis_service: StaticAnalysisService | None = None,
+        delivery_service: ReleaseDeliveryService | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._db = db
@@ -1368,6 +1432,7 @@ class WorkflowOrchestrator:
             sandbox_client=sandbox_client,
             checkpointer=checkpointer,
             static_analysis_service=static_analysis_service,
+            delivery_service=delivery_service,
             settings=self._settings,
         )
 
@@ -1378,7 +1443,9 @@ class WorkflowOrchestrator:
         repository: RepositoryModel,
         workspace_dir: Path,
         tracing_enabled: bool,
+        workspace_id: str | None = None,
     ) -> WorkflowState:
+        resolved_ws = workspace_dir.resolve()
         return {
             "state_schema_version": WORKFLOW_STATE_SCHEMA_VERSION,
             "workflow_id": run.id,
@@ -1390,7 +1457,9 @@ class WorkflowOrchestrator:
             "tracing_enabled": tracing_enabled,
             "base_branch": run.base_branch,
             "base_commit_sha": run.base_commit_sha,
-            "workspace_dir": str(workspace_dir.resolve()),
+            "workspace_id": workspace_id or resolved_ws.name,
+            "workspace_dir": str(resolved_ws),
+            "created_by": run.created_by,
             "title": run.title,
             "request_text": run.request_text,
             "cost_limit_usd": str(run.cost_limit_usd),
@@ -1417,6 +1486,8 @@ class WorkflowOrchestrator:
             "static_analysis_history": [],
             "code_review_history": [],
             "commit_approved": False,
+            "pull_request_delivery": None,
+            "artifact_ids": [],
             "usage_records": [],
             "node_history": [],
         }
@@ -1455,6 +1526,17 @@ class WorkflowOrchestrator:
             if isinstance(release_raw, dict) and release_raw.get("pr_title")
             else None
         )
+        pr_delivery_raw = values.get("pull_request_delivery")
+        pr_number = (
+            int(pr_delivery_raw["pr_number"])
+            if isinstance(pr_delivery_raw, dict) and pr_delivery_raw.get("pr_number")
+            else None
+        )
+        pr_url = (
+            str(pr_delivery_raw["html_url"])
+            if isinstance(pr_delivery_raw, dict) and pr_delivery_raw.get("html_url")
+            else None
+        )
         patch_hash_val = values.get("patch_hash")
         if not patch_hash_val:
             patch_apply_raw = values.get("patch_apply_result")
@@ -1489,6 +1571,9 @@ class WorkflowOrchestrator:
             review_passed=review_passed,
             commit_approved=bool(values.get("commit_approved", False)),
             pr_title=pr_title,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            artifact_ids=[str(aid) for aid in values.get("artifact_ids", [])],
             error_code=str(values["error_code"]) if values.get("error_code") else None,
             error_message=str(values["error_message"]) if values.get("error_message") else None,
             node_history=list(values.get("node_history", [])),
@@ -1528,6 +1613,7 @@ class WorkflowOrchestrator:
         idempotency_key: str,
         cost_limit_usd: Decimal,
         actor: str,
+        workspace_id: str | None = None,
     ) -> WorkflowExecutionSnapshot:
         """Start a version-pinned SDLC workflow idempotently until pause or completion."""
         if cost_limit_usd <= Decimal("0"):
@@ -1580,6 +1666,7 @@ class WorkflowOrchestrator:
             repository=repository,
             workspace_dir=workspace_dir,
             tracing_enabled=tracing_enabled,
+            workspace_id=workspace_id,
         )
         self._graph.invoke(initial_state, config=config)
         post_snapshot = self._graph.get_state(config)
@@ -1605,6 +1692,7 @@ class WorkflowOrchestrator:
         *,
         workflow_id: str,
         workspace_dir: Path,
+        workspace_id: str | None = None,
     ) -> WorkflowExecutionSnapshot:
         """Execute a pre-created queued workflow idempotently inside a background worker."""
         run = self._db.scalar(
@@ -1660,6 +1748,7 @@ class WorkflowOrchestrator:
             repository=repository,
             workspace_dir=workspace_dir,
             tracing_enabled=tracing_enabled,
+            workspace_id=workspace_id,
         )
         self._graph.invoke(initial_state, config=invoke_config)
         post_snapshot = self._graph.get_state(lookup_config)
