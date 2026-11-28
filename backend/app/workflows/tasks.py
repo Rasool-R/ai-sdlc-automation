@@ -8,6 +8,7 @@ Retry ownership:
   releasing the worker.
 """
 
+import contextlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -189,6 +190,7 @@ def execute_workflow_job(
     sandbox_client: SandboxClient | None = None,
     static_analysis_service: StaticAnalysisService | None = None,
     checkpointer: Any | None = None,
+    commit_progress: bool = False,
 ) -> WorkflowExecutionSnapshot:
     """Execute a queued workflow idempotently under a repository lock."""
     resolved_settings = settings or get_settings()
@@ -233,8 +235,10 @@ def execute_workflow_job(
     lock_owner = f"worker:start:{workflow_id}:{uuid.uuid4().hex[:8]}"
     ws_id = workflow_workspace_id(workflow_id)
     wf_token = workflow_id_ctx.set(workflow_id)
+    on_progress: Callable[[], None] | None = db.commit if commit_progress else None
     lock_acquired = False
     should_cleanup_workspace = False
+    failed = False
 
     try:
         locks.acquire(
@@ -244,6 +248,8 @@ def execute_workflow_job(
             ttl_seconds=resolved_settings.WORKFLOW_TIMEOUT_SECONDS,
         )
         lock_acquired = True
+        if commit_progress:
+            db.commit()
 
         if run.status == "cancelled":
             should_cleanup_workspace = True
@@ -261,6 +267,7 @@ def execute_workflow_job(
                     sandbox_client=sbx,
                     static_analysis_service=static_analysis_service,
                     delivery_service=resolved_delivery,
+                    on_progress=on_progress,
                     checkpointer=saver,
                     settings=resolved_settings,
                 )
@@ -295,6 +302,7 @@ def execute_workflow_job(
                 sandbox_client=sbx,
                 static_analysis_service=static_analysis_service,
                 delivery_service=resolved_delivery,
+                on_progress=on_progress,
                 checkpointer=saver,
                 settings=resolved_settings,
             )
@@ -307,11 +315,27 @@ def execute_workflow_job(
         if snapshot.status in _TERMINAL_STATUSES:
             should_cleanup_workspace = True
         return snapshot
+    except BaseException:
+        failed = True
+        raise
     finally:
         if should_cleanup_workspace:
             ws.cleanup_workspace(ws_id)
         if lock_acquired:
-            locks.release(repository_id=repo.id, owner_id=lock_owner)
+            if failed and commit_progress:
+                with contextlib.suppress(Exception):
+                    db.rollback()
+            try:
+                locks.release(repository_id=repo.id, owner_id=lock_owner)
+                if commit_progress:
+                    db.commit()
+            except Exception:
+                if not failed:
+                    raise
+                logger.warning(
+                    "Failed to release repository lock after worker error",
+                    extra={"structured_data": {"workflow_id": workflow_id, "repo_id": repo.id}},
+                )
         if owns_github:
             gh.close()
         if owns_llm:
@@ -339,6 +363,7 @@ def resume_workflow_job(
     sandbox_client: SandboxClient | None = None,
     static_analysis_service: StaticAnalysisService | None = None,
     checkpointer: Any | None = None,
+    commit_progress: bool = False,
 ) -> WorkflowExecutionSnapshot:
     """Resume a paused workflow from its checkpoint under a repository lock."""
     resolved_settings = settings or get_settings()
@@ -383,8 +408,10 @@ def resume_workflow_job(
     lock_owner = f"worker:resume:{workflow_id}:{uuid.uuid4().hex[:8]}"
     ws_id = workflow_workspace_id(workflow_id)
     wf_token = workflow_id_ctx.set(workflow_id)
+    on_progress: Callable[[], None] | None = db.commit if commit_progress else None
     lock_acquired = False
     should_cleanup_workspace = False
+    failed = False
 
     try:
         locks.acquire(
@@ -394,6 +421,8 @@ def resume_workflow_job(
             ttl_seconds=resolved_settings.WORKFLOW_TIMEOUT_SECONDS,
         )
         lock_acquired = True
+        if commit_progress:
+            db.commit()
 
         if decision.action != "reject":
             _ensure_workflow_workspace(
@@ -421,6 +450,7 @@ def resume_workflow_job(
                 sandbox_client=sbx,
                 static_analysis_service=static_analysis_service,
                 delivery_service=resolved_delivery,
+                on_progress=on_progress,
                 checkpointer=saver,
                 settings=resolved_settings,
             )
@@ -432,11 +462,27 @@ def resume_workflow_job(
         if snapshot.status in _TERMINAL_STATUSES:
             should_cleanup_workspace = True
         return snapshot
+    except BaseException:
+        failed = True
+        raise
     finally:
         if should_cleanup_workspace:
             ws.cleanup_workspace(ws_id)
         if lock_acquired:
-            locks.release(repository_id=repo.id, owner_id=lock_owner)
+            if failed and commit_progress:
+                with contextlib.suppress(Exception):
+                    db.rollback()
+            try:
+                locks.release(repository_id=repo.id, owner_id=lock_owner)
+                if commit_progress:
+                    db.commit()
+            except Exception:
+                if not failed:
+                    raise
+                logger.warning(
+                    "Failed to release repository lock after worker resume error",
+                    extra={"structured_data": {"workflow_id": workflow_id, "repo_id": repo.id}},
+                )
         if owns_github:
             gh.close()
         if owns_llm:
@@ -500,7 +546,11 @@ def run_workflow_task(self: Any, workflow_id: str) -> dict[str, Any]:
     _ = self
     db = SessionLocal()
     try:
-        snapshot = execute_workflow_job(db=db, workflow_id=workflow_id)
+        snapshot = execute_workflow_job(
+            db=db,
+            workflow_id=workflow_id,
+            commit_progress=True,
+        )
         db.commit()
         return snapshot.model_dump(mode="json")
     except AppError:
@@ -532,7 +582,12 @@ def resume_workflow_task(
     decision = HumanDecision.model_validate(decision_payload)
     db = SessionLocal()
     try:
-        snapshot = resume_workflow_job(db=db, workflow_id=workflow_id, decision=decision)
+        snapshot = resume_workflow_job(
+            db=db,
+            workflow_id=workflow_id,
+            decision=decision,
+            commit_progress=True,
+        )
         db.commit()
         return snapshot.model_dump(mode="json")
     except AppError:

@@ -2,7 +2,7 @@
 
 Architecture invariants:
 - LangGraph checkpoints are the single source of truth for execution state.
-- WorkflowRunModel and governance tables are projections synced idempotently at transitions.
+- WorkflowRunModel, governance tables, and workflow_events are projections synced idempotently.
 - Routing is strictly deterministic Python (no LLM-based Supervisor).
 - Human approvals bind explicitly to (plan_hash, base_commit_sha) and (patch_hash, base_commit_sha).
 - Bounded correction loops guarantee infinite retries are impossible.
@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -63,6 +64,7 @@ from app.models.workflow import WorkflowRunModel
 from app.observability.tracing import build_langgraph_run_config
 from app.services.audit_service import AuditService
 from app.services.delivery_service import ReleaseDeliveryService
+from app.services.event_service import WorkflowEventService
 from app.workflows.governance import WorkflowGovernanceRecorder
 from app.workflows.state import (
     WORKFLOW_STATE_SCHEMA_VERSION,
@@ -1405,7 +1407,7 @@ def build_sdlc_workflow_graph(
 
 
 class WorkflowOrchestrator:
-    """Runs, resumes, cancels, and reconciles workflows while keeping projections in sync."""
+    """Runs, resumes, cancels, and reconciles workflows while streaming projections/events."""
 
     def __init__(
         self,
@@ -1418,12 +1420,15 @@ class WorkflowOrchestrator:
         checkpointer: Any,
         static_analysis_service: StaticAnalysisService | None = None,
         delivery_service: ReleaseDeliveryService | None = None,
+        on_progress: Callable[[], None] | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._db = db
         self._settings = settings or get_settings()
         self._audit = AuditService(db)
         self._governance = WorkflowGovernanceRecorder(db)
+        self._events = WorkflowEventService(db)
+        self._on_progress = on_progress
         self._graph = build_sdlc_workflow_graph(
             db=db,
             llm_client=llm_client,
@@ -1587,19 +1592,53 @@ class WorkflowOrchestrator:
         reused_existing: bool = False,
     ) -> WorkflowExecutionSnapshot:
         values: dict[str, Any] = dict(getattr(checkpoint_snapshot, "values", {}) or {})
-        status, current_node, _interrupted, _payload = _derive_status_from_snapshot(
+        status, current_node, _interrupted, interrupt_payload = _derive_status_from_snapshot(
             checkpoint_snapshot
         )
         run.status = status
         run.current_node = current_node
         if values:
             self._governance.sync_from_state(workflow_id=run.id, state=values)
+            self._events.sync_transition_events(
+                workflow_id=run.id,
+                status=status,
+                current_node=current_node,
+                state=values,
+                interrupt_payload=interrupt_payload,
+            )
         self._db.flush()
         return self._build_snapshot_response(
             run=run,
             checkpoint_snapshot=checkpoint_snapshot,
             reused_existing=reused_existing,
         )
+
+    def _run_graph_with_event_sync(
+        self,
+        *,
+        run: WorkflowRunModel,
+        graph_input: Any,
+        invoke_config: dict[str, Any],
+        lookup_config: dict[str, Any],
+    ) -> WorkflowExecutionSnapshot:
+        """Stream LangGraph supersteps so projections and SSE events update per completed node."""
+        for chunk in self._graph.stream(
+            graph_input,
+            config=invoke_config,
+            stream_mode="updates",
+        ):
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                continue
+            step_snapshot = self._graph.get_state(lookup_config)
+            self._sync_projection(run=run, checkpoint_snapshot=step_snapshot)
+            if self._on_progress is not None:
+                self._on_progress()
+
+        post_snapshot = self._graph.get_state(lookup_config)
+        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
+        if self._on_progress is not None:
+            self._on_progress()
+        return response
 
     def start_workflow(
         self,
@@ -1668,9 +1707,12 @@ class WorkflowOrchestrator:
             tracing_enabled=tracing_enabled,
             workspace_id=workspace_id,
         )
-        self._graph.invoke(initial_state, config=config)
-        post_snapshot = self._graph.get_state(config)
-        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
+        response = self._run_graph_with_event_sync(
+            run=run,
+            graph_input=initial_state,
+            invoke_config=config,
+            lookup_config=config,
+        )
 
         self._audit.record(
             actor=actor,
@@ -1750,9 +1792,12 @@ class WorkflowOrchestrator:
             tracing_enabled=tracing_enabled,
             workspace_id=workspace_id,
         )
-        self._graph.invoke(initial_state, config=invoke_config)
-        post_snapshot = self._graph.get_state(lookup_config)
-        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
+        response = self._run_graph_with_event_sync(
+            run=run,
+            graph_input=initial_state,
+            invoke_config=invoke_config,
+            lookup_config=lookup_config,
+        )
 
         self._audit.record(
             actor=run.created_by,
@@ -1818,12 +1863,12 @@ class WorkflowOrchestrator:
             llm_data_sharing=bool(values.get("llm_data_sharing", False)),
         )
 
-        self._graph.invoke(
-            Command(resume=decision.model_dump(mode="json")),
-            config=invoke_config,
+        response = self._run_graph_with_event_sync(
+            run=run,
+            graph_input=Command(resume=decision.model_dump(mode="json")),
+            invoke_config=invoke_config,
+            lookup_config=lookup_config,
         )
-        post_snapshot = self._graph.get_state(lookup_config)
-        response = self._sync_projection(run=run, checkpoint_snapshot=post_snapshot)
 
         self._audit.record(
             actor=decision.actor,
@@ -1865,14 +1910,26 @@ class WorkflowOrchestrator:
                     f"Workflow in terminal status '{run.status}' cannot be cancelled.",
                     details={"workflow_id": workflow_id, "status": run.status},
                 )
+            cancel_msg = reason or "Cancelled before worker start."
             run.status = "cancelled"
+            self._events.sync_transition_events(
+                workflow_id=run.id,
+                status="cancelled",
+                current_node=run.current_node,
+                state={
+                    "base_commit_sha": run.base_commit_sha,
+                    "error_code": "WORKFLOW_CANCELLED",
+                    "error_message": cancel_msg,
+                },
+                interrupt_payload=None,
+            )
             self._db.flush()
             self._audit.record(
                 actor=actor,
                 action="workflow.cancel",
                 resource_type="workflow",
                 resource_id=run.id,
-                details={"reason": reason or "Cancelled before worker start."},
+                details={"reason": cancel_msg},
             )
             return WorkflowExecutionSnapshot(
                 workflow_id=run.id,

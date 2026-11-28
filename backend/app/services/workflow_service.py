@@ -32,6 +32,7 @@ from app.schemas.workflow import (
     WorkflowUsageSummaryRead,
 )
 from app.services.audit_service import AuditService
+from app.services.event_service import WorkflowEventService
 from app.workflows.state import HumanDecision
 from app.workflows.tasks import WorkflowJobDispatcher
 
@@ -61,6 +62,7 @@ class WorkflowService:
         self._dispatcher = dispatcher
         self._max_concurrent = max_concurrent_workflows
         self._audit = AuditService(db)
+        self._events = WorkflowEventService(db)
 
     def _get_run(self, workflow_id: str) -> WorkflowRunModel:
         run = self._db.scalar(
@@ -180,6 +182,20 @@ class WorkflowService:
         self._db.flush()
 
         job_id = self._dispatcher.enqueue_start(run.id)
+        self._events.record_event(
+            workflow_id=run.id,
+            event_type="workflow.enqueued",
+            status=run.status,
+            node_name=run.current_node,
+            message="Workflow created and queued for background execution.",
+            payload={
+                "repository_id": repo.id,
+                "base_branch": target_branch,
+                "base_commit_sha": base_commit_sha,
+                "cost_limit_usd": str(payload.cost_limit_usd),
+                "job_id": job_id,
+            },
+        )
         self._audit.record(
             actor=actor,
             action="workflow.enqueue",
@@ -338,6 +354,22 @@ class WorkflowService:
         )
         job_id = self._dispatcher.enqueue_resume(run.id, decision)
 
+        self._events.record_event(
+            workflow_id=run.id,
+            event_type="human.approval_submitted",
+            status=run.status,
+            node_name=run.current_node,
+            message="Operator submitted approval decision; workflow resumption queued.",
+            payload={
+                "actor": actor,
+                "status_before": run.status,
+                "approved_base_commit_sha": payload.approved_base_commit_sha,
+                "approved_plan_hash": payload.approved_plan_hash,
+                "approved_patch_hash": payload.approved_patch_hash,
+                "approved_protected_paths": list(payload.approved_protected_paths),
+                "job_id": job_id,
+            },
+        )
         self._audit.record(
             actor=actor,
             action="workflow.approve.enqueued",
@@ -380,6 +412,19 @@ class WorkflowService:
         )
         job_id = self._dispatcher.enqueue_resume(run.id, decision)
 
+        self._events.record_event(
+            workflow_id=run.id,
+            event_type="human.rejection_submitted",
+            status=run.status,
+            node_name=run.current_node,
+            message=payload.reason or "Operator submitted rejection decision; termination queued.",
+            payload={
+                "actor": actor,
+                "status_before": run.status,
+                "reason": payload.reason,
+                "job_id": job_id,
+            },
+        )
         self._audit.record(
             actor=actor,
             action="workflow.reject.enqueued",
@@ -420,6 +465,17 @@ class WorkflowService:
         )
         job_id = self._dispatcher.enqueue_resume(run.id, decision)
 
+        self._events.record_event(
+            workflow_id=run.id,
+            event_type="human.clarification_submitted",
+            status=run.status,
+            node_name=run.current_node,
+            message="Operator submitted clarification answers; workflow resumption queued.",
+            payload={
+                "actor": actor,
+                "job_id": job_id,
+            },
+        )
         self._audit.record(
             actor=actor,
             action="workflow.resume.enqueued",
@@ -454,6 +510,19 @@ class WorkflowService:
         self._db.flush()
 
         job_id = self._dispatcher.enqueue_cancel(run.id, actor, payload.reason)
+        self._events.record_event(
+            workflow_id=run.id,
+            event_type="workflow.cancelled",
+            status="cancelled",
+            node_name=run.current_node,
+            message=payload.reason or "Workflow cancelled by operator.",
+            payload={
+                "actor": actor,
+                "previous_status": previous_status,
+                "reason": payload.reason,
+                "job_id": job_id,
+            },
+        )
         self._audit.record(
             actor=actor,
             action="workflow.cancel.enqueued",
